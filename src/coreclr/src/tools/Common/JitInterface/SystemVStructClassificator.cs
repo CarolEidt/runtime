@@ -111,14 +111,25 @@ namespace Internal.JitInterface
                     structPassInRegDescPtr.passedInRegisters = canPassInRegisters;
                     structPassInRegDescPtr.eightByteCount = (byte)helper.EightByteCount;
                     Debug.Assert(structPassInRegDescPtr.eightByteCount <= CLR_SYSTEMV_MAX_EIGHTBYTES_COUNT_TO_PASS_IN_REGISTERS);
+                    Debug.Assert((structPassInRegDescPtr.eightByteCount <= 2) ||
+                                 ((structPassInRegDescPtr.eightByteClassifications2 == SystemVClassificationTypeSSEUp) &&
+                                  (structPassInRegDescPtr.eightByteClassifications3 == SystemVClassificationTypeSSEUp)));
 
                     structPassInRegDescPtr.eightByteClassifications0 = helper.EightByteClassifications[0];
                     structPassInRegDescPtr.eightByteSizes0 = (byte)helper.EightByteSizes[0];
                     structPassInRegDescPtr.eightByteOffsets0 = (byte)helper.EightByteOffsets[0];
-                        
+
                     structPassInRegDescPtr.eightByteClassifications1 = helper.EightByteClassifications[1];
                     structPassInRegDescPtr.eightByteSizes1 = (byte)helper.EightByteSizes[1];
                     structPassInRegDescPtr.eightByteOffsets1 = (byte)helper.EightByteOffsets[1];
+
+                    structPassInRegDescPtr.eightByteClassifications2 = helper.EightByteClassifications[2];
+                    structPassInRegDescPtr.eightByteSizes2 = (byte)helper.EightByteSizes[2];
+                    structPassInRegDescPtr.eightByteOffsets2 = (byte)helper.EightByteOffsets[2];
+
+                    structPassInRegDescPtr.eightByteClassifications3 = helper.EightByteClassifications[3];
+                    structPassInRegDescPtr.eightByteSizes3 = (byte)helper.EightByteSizes[3];
+                    structPassInRegDescPtr.eightByteOffsets3 = (byte)helper.EightByteOffsets[3];
                 }
             }
         }
@@ -239,8 +250,9 @@ namespace Internal.JitInterface
             {
                 return false;
             }
+            int typeSize = typeDesc.GetElementSize().AsInt;
 
-            // The SIMD Intrinsic types are meant to be handled specially and should not be passed as struct registers
+            // The SIMD Intrinsic opaque vector types are handled specially.
             if (typeDesc.IsIntrinsic)
             {
                 InstantiatedType instantiatedType = typeDesc as InstantiatedType;
@@ -249,9 +261,29 @@ namespace Internal.JitInterface
                     if (VectorFieldLayoutAlgorithm.IsVectorType(instantiatedType) ||
                         VectorOfTFieldLayoutAlgorithm.IsVectorOfTType(instantiatedType))
                     {
-                        return false;
+                        Debug.Assert(typeSize == 8 || typeSize == 16 || typeSize == 32);
+                        helper.FieldSizes[0] = typeSize;
+                        helper.FieldClassifications[0] = SystemVClassificationTypeSSE;
+                        if (typeSize > 8)
+                        {
+                            helper.FieldClassifications[1] = SystemVClassificationTypeSSEUp;
+                            if (typeSize == 32)
+                            {
+                                helper.FieldClassifications[2] = SystemVClassificationTypeSSEUp;
+                                helper.FieldClassifications[3] = SystemVClassificationTypeSSEUp;
+                            }
+                        }
+                        // Just one field.
+                        helper.CurrentUniqueOffsetField = 1;
+                        AssignClassifiedEightByteTypes(ref helper);
+                        return true;
                     }
                 }
+            }
+
+            if (typeSize > CLR_SYSTEMV_MAX_NON_VECTOR_BYTES_TO_PASS_IN_REGISTERS)
+            {
+                return false;
             }
 
             MetadataType mdType = typeDesc as MetadataType;
@@ -498,7 +530,7 @@ namespace Internal.JitInterface
                         {
                             helper.EightByteClassifications[currentFieldEightByte] = SystemVClassificationTypeIntegerByRef;
                         }
-                        else
+                        else if (helper.EightByteClassifications[currentFieldEightByte] != SystemVClassificationTypeSSEUp)
                         {
                             helper.EightByteClassifications[currentFieldEightByte] = SystemVClassificationTypeSSE;
                         }

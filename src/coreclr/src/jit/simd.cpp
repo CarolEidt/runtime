@@ -507,9 +507,7 @@ var_types Compiler::getBaseTypeAndSizeOfSIMDType(CORINFO_CLASS_HANDLE typeHnd, u
             size         = Vector128SizeBytes;
             JITDUMP("  Known type Vector128<ulong>\n");
         }
-        else
-#if defined(TARGET_ARM64)
-            if (typeHnd == m_simdHandleCache->Vector64FloatHandle)
+        else if (typeHnd == m_simdHandleCache->Vector64FloatHandle)
         {
             simdBaseType = TYP_FLOAT;
             size         = Vector64SizeBytes;
@@ -569,7 +567,6 @@ var_types Compiler::getBaseTypeAndSizeOfSIMDType(CORINFO_CLASS_HANDLE typeHnd, u
             size         = Vector64SizeBytes;
             JITDUMP("  Known type Vector64<ulong>\n");
         }
-#endif // defined(TARGET_ARM64)
 
         // slow path search
         if (simdBaseType == TYP_UNKNOWN)
@@ -708,7 +705,6 @@ var_types Compiler::getBaseTypeAndSizeOfSIMDType(CORINFO_CLASS_HANDLE typeHnd, u
                             JITDUMP("  Unknown Hardware Intrinsic SIMD Type Vector128<T>\n");
                     }
                 }
-#if defined(TARGET_ARM64)
                 else if (strcmp(className, "Vector64`1") == 0)
                 {
                     size = Vector64SizeBytes;
@@ -769,7 +765,6 @@ var_types Compiler::getBaseTypeAndSizeOfSIMDType(CORINFO_CLASS_HANDLE typeHnd, u
                             JITDUMP("  Unknown Hardware Intrinsic SIMD Type Vector64<T>\n");
                     }
                 }
-#endif // defined(TARGET_ARM64)
             }
         }
 

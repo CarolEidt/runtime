@@ -1147,6 +1147,9 @@ void Compiler::dumpSystemVClassificationType(SystemVClassificationType ct)
         case SystemVClassificationTypeSSE:
             printf("SSE");
             break;
+        case SystemVClassificationTypeSSEUp:
+            printf("SSEUp");
+            break;
         default:
             printf("ILLEGAL");
             break;

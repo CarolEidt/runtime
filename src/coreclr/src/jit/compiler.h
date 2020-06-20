@@ -765,7 +765,7 @@ public:
     regMaskTP lvRegMask() const
     {
         regMaskTP regMask = RBM_NONE;
-        if (varTypeIsFloating(TypeGet()))
+        if (varTypeUsesFloatReg(TypeGet()))
         {
             if (GetRegNum() != REG_STK)
             {
@@ -901,7 +901,7 @@ public:
                     bool                 propagate = true);
     bool IsFloatRegType() const
     {
-        return isFloatRegType(lvType) || lvIsHfaRegArg();
+        return varTypeUsesFloatReg(lvType) || lvIsHfaRegArg();
     }
 
     var_types GetHfaType() const
@@ -1726,6 +1726,13 @@ public:
 #endif // TARGET_ARM64
         }
 #endif // FEATURE_HFA
+#ifdef UNIX_AMD64_ABI
+        if (varTypeIsSIMD(argType))
+        {
+            assert((argType == TYP_SIMD16) || (argType == TYP_SIMD32));
+            size = (argType == TYP_SIMD16) ? 2 : 4;
+        }
+#endif // UNIX_AMD64_ABI
         return size;
     }
 
@@ -7859,7 +7866,6 @@ private:
         CORINFO_CLASS_HANDLE SIMDVectorHandle;
 
 #ifdef FEATURE_HW_INTRINSICS
-#if defined(TARGET_ARM64)
         CORINFO_CLASS_HANDLE Vector64FloatHandle;
         CORINFO_CLASS_HANDLE Vector64DoubleHandle;
         CORINFO_CLASS_HANDLE Vector64IntHandle;
@@ -7870,7 +7876,6 @@ private:
         CORINFO_CLASS_HANDLE Vector64LongHandle;
         CORINFO_CLASS_HANDLE Vector64UIntHandle;
         CORINFO_CLASS_HANDLE Vector64ULongHandle;
-#endif // defined(TARGET_ARM64)
         CORINFO_CLASS_HANDLE Vector128FloatHandle;
         CORINFO_CLASS_HANDLE Vector128DoubleHandle;
         CORINFO_CLASS_HANDLE Vector128IntHandle;
@@ -9165,7 +9170,7 @@ public:
         // On all other targets that support multireg return values:
         // Methods returning a struct in multiple registers have a return value of TYP_STRUCT.
         // Such method's compRetNativeType is TYP_STRUCT without a hidden RetBufArg
-        return varTypeIsStruct(info.compRetNativeType) && (info.compRetBuffArg == BAD_VAR_NUM);
+        return (info.compRetNativeType == TYP_STRUCT) && (info.compRetBuffArg == BAD_VAR_NUM);
 #endif // TARGET_XXX
 
 #else // not FEATURE_MULTIREG_RET

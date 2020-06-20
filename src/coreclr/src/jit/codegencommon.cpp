@@ -441,7 +441,7 @@ regMaskTP CodeGenInterface::genGetRegMask(const LclVarDsc* varDsc)
 
     assert(varDsc->lvIsInReg());
 
-    if (varTypeIsFloating(varDsc->TypeGet()))
+    if (varTypeUsesFloatReg(varDsc->TypeGet()))
     {
         regMask = genRegMaskFloat(varDsc->GetRegNum(), varDsc->TypeGet());
     }
@@ -3421,10 +3421,22 @@ void CodeGen::genFnPrologCalleeRegArgs(regNumber xtraReg, bool* pXtraRegClobbere
         int slots = 0;
 
 #if defined(UNIX_AMD64_ABI)
+        bool                 treatAsStruct = false;
+        CORINFO_CLASS_HANDLE typeHnd       = NO_CLASS_HANDLE;
         if (varTypeIsStruct(varDsc))
         {
-            CORINFO_CLASS_HANDLE typeHnd = varDsc->lvVerTypeInfo.GetClassHandle();
-            assert(typeHnd != nullptr);
+            treatAsStruct = true;
+            typeHnd       = varDsc->lvVerTypeInfo.GetClassHandle();
+        }
+        else if (varTypeUsesFloatReg(regType) != isValidFloatArgReg(varDsc->GetArgReg()))
+        {
+            assert(varDsc->lvIsStructField);
+            treatAsStruct = true;
+            typeHnd       = compiler->lvaGetDesc(varDsc->lvParentLcl)->lvVerTypeInfo.GetClassHandle();
+        }
+        if (treatAsStruct)
+        {
+            assert(typeHnd != NO_CLASS_HANDLE);
             SYSTEMV_AMD64_CORINFO_STRUCT_REG_PASSING_DESCRIPTOR structDesc;
             compiler->eeGetSystemVAmd64PassStructInRegisterDescriptor(typeHnd, &structDesc);
             if (!structDesc.passedInRegisters)
@@ -3467,6 +3479,16 @@ void CodeGen::genFnPrologCalleeRegArgs(regNumber xtraReg, bool* pXtraRegClobbere
                 if (varDsc->lvType == TYP_SIMD12)
                 {
                     regType = TYP_DOUBLE;
+                }
+                else if (structDesc.eightByteClassifications[slotCounter] == SystemVClassificationTypeSSEUp)
+                {
+                    // This will generally be a known SIMD type, but we can have a Vector<__Canon> which
+                    // the runtime will recognize as a Vector type to be passed in a register, but which
+                    // the JIT will not recognize as a SIMD type.
+                    // TODO-CQ: Fix this, as the JIT will then consider it a non-opaque struct of two longs,
+                    // and potentially promote it.
+                    // assert(varTypeIsSIMD(varDsc->lvType));
+                    break;
                 }
                 else
 #endif
@@ -11457,13 +11479,13 @@ void CodeGen::genReturn(GenTree* treeNode)
             genSimpleReturn(treeNode);
 #else // !TARGET_ARM64
 #if defined(TARGET_X86)
-            if (varTypeIsFloating(treeNode))
+            if (varTypeUsesFloatReg(treeNode))
             {
                 genFloatReturn(treeNode);
             }
             else
 #elif defined(TARGET_ARM)
-            if (varTypeIsFloating(treeNode) && (compiler->opts.compUseSoftFP || compiler->info.compIsVarArgs))
+            if (varTypeUsesFloatReg(treeNode) && (compiler->opts.compUseSoftFP || compiler->info.compIsVarArgs))
             {
                 if (targetType == TYP_FLOAT)
                 {
@@ -11479,7 +11501,7 @@ void CodeGen::genReturn(GenTree* treeNode)
             else
 #endif // TARGET_ARM
             {
-                regNumber retReg = varTypeIsFloating(treeNode) ? REG_FLOATRET : REG_INTRET;
+                regNumber retReg = varTypeUsesFloatReg(treeNode) ? REG_FLOATRET : REG_INTRET;
                 if (op1->GetRegNum() != retReg)
                 {
                     inst_RV_RV(ins_Move_Extend(targetType, true), retReg, op1->GetRegNum(), targetType);
@@ -11946,8 +11968,8 @@ void CodeGen::genRegCopy(GenTree* treeNode)
     // an argument, or returned from a call, in an integer register and must be
     // copied if it's in an xmm register.
 
-    bool srcFltReg = (varTypeIsFloating(op1) || varTypeIsSIMD(op1));
-    bool tgtFltReg = (varTypeIsFloating(treeNode) || varTypeIsSIMD(treeNode));
+    bool srcFltReg = (varTypeUsesFloatReg(op1));
+    bool tgtFltReg = (varTypeUsesFloatReg(treeNode));
     if (srcFltReg != tgtFltReg)
     {
         instruction ins;

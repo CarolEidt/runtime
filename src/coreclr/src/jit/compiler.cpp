@@ -776,7 +776,13 @@ var_types Compiler::getArgTypeForStruct(CORINFO_CLASS_HANDLE clsHnd,
 
 #ifdef UNIX_AMD64_ABI
                 // The case of (structDesc.eightByteCount == 1) should have already been handled
-                if ((structDesc.eightByteCount > 1) || !structDesc.passedInRegisters)
+                if (structDesc.passedInRegisters &&
+                    (structDesc.eightByteClassifications[1] == SystemVClassificationTypeSSEUp))
+                {
+                    howToPassStruct = SPK_ByValue;
+                    useType         = (structDesc.eightByteCount == 2) ? TYP_SIMD16 : TYP_SIMD32;
+                }
+                else if ((structDesc.eightByteCount > 1) || !structDesc.passedInRegisters)
                 {
                     // setup wbPassType and useType indicate that this is passed by value in multiple registers
                     //  (when all of the parameters registers are used, then the stack will be used)
@@ -958,10 +964,10 @@ var_types Compiler::getReturnTypeForStruct(CORINFO_CLASS_HANDLE clsHnd,
     // Check for cases where a small struct is returned in a register
     // via a primitive type.
     //
-    // The largest "primitive type" is MAX_PASS_SINGLEREG_BYTES
+    // The largest "primitive type" is TARGET_POINTER_SIZE
     // so we can skip calling getPrimitiveTypeForStruct when we
     // have a struct that is larger than that.
-    if (canReturnInRegister && (useType == TYP_UNKNOWN) && (structSize <= MAX_PASS_SINGLEREG_BYTES))
+    if (canReturnInRegister && (useType == TYP_UNKNOWN) && (structSize <= TARGET_POINTER_SIZE))
     {
         // We set the "primitive" useType based upon the structSize
         // and also examine the clsHnd to see if it is an HFA of count one
@@ -1032,13 +1038,23 @@ var_types Compiler::getReturnTypeForStruct(CORINFO_CLASS_HANDLE clsHnd,
 
 #ifdef UNIX_AMD64_ABI
 
-                // The case of (structDesc.eightByteCount == 1) should have already been handled
                 if (structDesc.eightByteCount > 1)
                 {
-                    // setup wbPassType and useType indicate that this is returned by value in multiple registers
-                    howToReturnStruct = SPK_ByValue;
-                    useType           = TYP_STRUCT;
-                    assert(structDesc.passedInRegisters == true);
+                    // If we have a SIMD type larger than one eightbyte, it will be the only register.
+                    // GetEightByteType asserts that.
+                    var_types firstType = GetEightByteType(structDesc, 0);
+                    if (varTypeIsSIMD(firstType))
+                    {
+                        howToReturnStruct = SPK_ByValue;
+                        useType           = firstType;
+                    }
+                    else
+                    {
+                        // setup wbPassType and useType indicate that this is returned by value in multiple registers
+                        howToReturnStruct = SPK_ByValue;
+                        useType           = TYP_STRUCT;
+                        assert(structDesc.passedInRegisters == true);
+                    }
                 }
                 else
                 {
@@ -6939,9 +6955,34 @@ var_types Compiler::GetEightByteType(const SYSTEMV_AMD64_CORINFO_STRUCT_REG_PASS
             {
                 eightByteType = TYP_FLOAT;
             }
-            else if (structDesc.eightByteSizes[slotNum] <= 8)
+            else if (structDesc.eightByteSizes[slotNum] == 8)
             {
-                eightByteType = TYP_DOUBLE;
+                unsigned maxSlotNum = CLR_SYSTEMV_MAX_EIGHTBYTES_COUNT_TO_PASS_IN_REGISTERS;
+                unsigned size       = 8;
+                for (unsigned slot = slotNum + 1; slot < maxSlotNum; slot++)
+                {
+                    if (structDesc.eightByteClassifications[slot] == SystemVClassificationTypeSSEUp)
+                    {
+                        size += 8;
+                    }
+                }
+                // We have only a single field for the vector case.
+                switch (size)
+                {
+                    case 8:
+                        eightByteType = TYP_DOUBLE;
+                        break;
+                    case 16:
+                        eightByteType = TYP_SIMD16;
+                        assert(structDesc.eightByteCount == 2);
+                        break;
+                    case 32:
+                        eightByteType = TYP_SIMD32;
+                        assert(structDesc.eightByteCount == 4);
+                        break;
+                    default:
+                        unreached();
+                }
             }
             else
             {

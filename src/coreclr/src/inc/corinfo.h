@@ -231,10 +231,12 @@ SELECTANY const GUID JITEEVersionIdentifier = { /* 2ca8d539-5db9-4831-8f1b-ade42
 //////////////////////////////////////////////////////////////////////////////////////////////////////////
 
 // For System V on the CLR type system number of registers to pass in and return a struct is the same.
-// The CLR type system allows only up to 2 eightbytes to be passed in registers. There is no SSEUP classification types.
-#define CLR_SYSTEMV_MAX_EIGHTBYTES_COUNT_TO_PASS_IN_REGISTERS   2
-#define CLR_SYSTEMV_MAX_EIGHTBYTES_COUNT_TO_RETURN_IN_REGISTERS 2
-#define CLR_SYSTEMV_MAX_STRUCT_BYTES_TO_PASS_IN_REGISTERS       16
+// The ABI allows only up to 2 eightbytes to be passed in registers, except in the case of 256-bit vectors,
+// which can be passed in a single register.
+#define CLR_SYSTEMV_MAX_EIGHTBYTES_COUNT_TO_PASS_IN_REGISTERS   4
+#define CLR_SYSTEMV_MAX_EIGHTBYTES_COUNT_TO_RETURN_IN_REGISTERS 4
+#define CLR_SYSTEMV_MAX_STRUCT_BYTES_TO_PASS_IN_REGISTERS       32
+#define CLR_SYSTEMV_MAX_NON_VECTOR_BYTES_TO_PASS_IN_REGISTERS   16
 
 // System V struct passing
 // The Classification types are described in the ABI spec at https://software.intel.com/sites/default/files/article/402129/mpx-linux64-abi.pdf
@@ -248,7 +250,7 @@ enum SystemVClassificationType : unsigned __int8
     SystemVClassificationTypeIntegerReference   = 5,
     SystemVClassificationTypeIntegerByRef       = 6,
     SystemVClassificationTypeSSE                = 7,
-    // SystemVClassificationTypeSSEUp           = Unused, // Not supported by the CLR.
+    SystemVClassificationTypeSSEUp              = 8,
     // SystemVClassificationTypeX87             = Unused, // Not supported by the CLR.
     // SystemVClassificationTypeX87Up           = Unused, // Not supported by the CLR.
     // SystemVClassificationTypeComplexX87      = Unused, // Not supported by the CLR.

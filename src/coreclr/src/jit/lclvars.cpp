@@ -149,7 +149,8 @@ void Compiler::lvaInitTypeRef()
         var_types                   returnType = getReturnTypeForStruct(retClsHnd, &howToReturnStruct);
 
         // We can safely widen the return type for enclosed structs.
-        if ((howToReturnStruct == SPK_PrimitiveType) || (howToReturnStruct == SPK_EnclosingType))
+        if ((howToReturnStruct == SPK_PrimitiveType) || (howToReturnStruct == SPK_EnclosingType) ||
+            ((howToReturnStruct == SPK_ByValue) && (returnType != TYP_STRUCT)))
         {
             assert(returnType != TYP_UNKNOWN);
             assert(returnType != TYP_STRUCT);
@@ -772,6 +773,10 @@ void Compiler::lvaInitUserArgs(InitVarDscInfo* varDscInfo)
                     {
                         floatRegCount++;
                     }
+                    else if (structDesc.eightByteClassifications[i] == SystemVClassificationTypeSSEUp)
+                    {
+                        continue;
+                    }
                     else
                     {
                         assert(false && "Invalid eightbyte classification type.");
@@ -872,7 +877,7 @@ void Compiler::lvaInitUserArgs(InitVarDscInfo* varDscInfo)
                 varDsc->SetArgReg(genMapRegArgNumToRegNum(firstAllocatedRegArgNum, firstEightByteType));
 
                 // If there is a second eightbyte, get a register for it too and map the arg to the reg number.
-                if (structDesc.eightByteCount >= 2)
+                if (!varTypeIsSIMD(firstEightByteType) && structDesc.eightByteCount >= 2)
                 {
                     secondEightByteType      = GetEightByteType(structDesc, 1);
                     secondAllocatedRegArgNum = varDscInfo->allocRegArg(secondEightByteType, 1);
@@ -910,12 +915,12 @@ void Compiler::lvaInitUserArgs(InitVarDscInfo* varDscInfo)
 #if defined(UNIX_AMD64_ABI)
                 if (varTypeIsStruct(argType) && (structDesc.eightByteCount >= 1))
                 {
-                    isFloat = varTypeIsFloating(firstEightByteType);
+                    isFloat = varTypeUsesFloatReg(firstEightByteType);
                 }
                 else
 #endif // !UNIX_AMD64_ABI
                 {
-                    isFloat = varTypeIsFloating(argType);
+                    isFloat = varTypeUsesFloatReg(argType);
                 }
 
 #if defined(UNIX_AMD64_ABI)
@@ -941,13 +946,13 @@ void Compiler::lvaInitUserArgs(InitVarDscInfo* varDscInfo)
                     {
                         printf(", secondEightByte: %s",
                                getRegName(genMapRegArgNumToRegNum(secondAllocatedRegArgNum, secondEightByteType),
-                                          varTypeIsFloating(secondEightByteType)));
+                                          varTypeUsesFloatReg(secondEightByteType)));
                     }
                 }
                 else
 #endif // defined(UNIX_AMD64_ABI)
                 {
-                    isFloat            = varTypeIsFloating(argType);
+                    isFloat            = varTypeUsesFloatReg(argType);
                     unsigned regArgNum = genMapRegNumToRegArgNum(varDsc->GetArgReg(), argType);
 
                     for (unsigned ix = 0; ix < cSlots; ix++, regArgNum++)
@@ -999,7 +1004,7 @@ void Compiler::lvaInitUserArgs(InitVarDscInfo* varDscInfo)
         {
 #if defined(TARGET_ARM)
             varDscInfo->setAllRegArgUsed(argType);
-            if (varTypeIsFloating(argType))
+            if (varTypeUsesFloatReg(argType))
             {
                 varDscInfo->setAnyFloatStackArgs();
             }
@@ -1244,7 +1249,7 @@ void Compiler::lvaInitVarDsc(LclVarDsc*              varDsc,
     }
 
     var_types type = JITtype2varType(corInfoType);
-    if (varTypeIsFloating(type))
+    if (varTypeUsesFloatReg(type))
     {
         compFloatingPointUsed = true;
     }
@@ -1873,6 +1878,18 @@ bool Compiler::StructPromotionHelper::CanPromoteStructVar(unsigned lclNum)
             {
                 canPromote = false;
             }
+            else
+            {
+                // Don't promote a SIMD type that's passed or returned in a register.
+                SYSTEMV_AMD64_CORINFO_STRUCT_REG_PASSING_DESCRIPTOR structDesc;
+                compiler->eeGetSystemVAmd64PassStructInRegisterDescriptor(typeHnd, &structDesc);
+                assert(structDesc.passedInRegisters);
+                if ((structDesc.eightByteCount > 1) &&
+                    (structDesc.eightByteClassifications[1] == SystemVClassificationTypeSSEUp))
+                {
+                    canPromote = false;
+                }
+            }
         }
 #endif // UNIX_AMD64_ABI
     }
@@ -2189,7 +2206,7 @@ void Compiler::StructPromotionHelper::PromoteStructVar(unsigned lclNum)
     {
         const lvaStructFieldInfo* pFieldInfo = &structPromotionInfo.fields[index];
 
-        if (varTypeIsFloating(pFieldInfo->fldType) || varTypeIsSIMD(pFieldInfo->fldType))
+        if (varTypeUsesFloatReg(pFieldInfo->fldType))
         {
             // Whenever we promote a struct that contains a floating point field
             // it's possible we transition from a method that originally only had integer

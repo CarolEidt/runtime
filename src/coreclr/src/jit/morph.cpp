@@ -1032,6 +1032,10 @@ fgArgTabEntry* fgArgInfo::AddRegArg(unsigned                                    
                                     const unsigned                                                   structFloatRegs,
                                     const SYSTEMV_AMD64_CORINFO_STRUCT_REG_PASSING_DESCRIPTOR* const structDescPtr)
 {
+    if ((numRegs > 1) && (structDescPtr->eightByteClassifications[1] == SystemVClassificationTypeSSEUp))
+    {
+        numRegs = 1;
+    }
     fgArgTabEntry* curArgTabEntry = AddRegArg(argNum, node, use, regNum, numRegs, alignment, isStruct, isVararg);
     assert(curArgTabEntry != nullptr);
 
@@ -1335,7 +1339,7 @@ void fgArgInfo::ArgsComplete()
                 curArgTabEntry->needTmp = true;
                 needsTemps              = true;
             }
-            else if (varTypeIsFloating(argx->TypeGet()) && (argx->OperGet() == GT_CALL))
+            else if ((curArgTabEntry->floatRegCount() != 0) && (argx->OperGet() == GT_CALL))
             {
                 // Spill all arguments that are floating point calls
                 curArgTabEntry->needTmp = true;
@@ -2879,7 +2883,7 @@ void Compiler::fgInitArgInfo(GenTreeCall* call)
 #endif // FEATURE_HFA
 
 #ifdef TARGET_ARM
-        passUsingFloatRegs    = !callIsVararg && (isHfaArg || varTypeIsFloating(argx)) && !opts.compUseSoftFP;
+        passUsingFloatRegs    = !callIsVararg && (isHfaArg || varTypeUsesFloatReg(argx)) && !opts.compUseSoftFP;
         bool passUsingIntRegs = passUsingFloatRegs ? false : (intArgRegNum < MAX_REG_ARG);
 
         // We don't use the "size" return value from InferOpSizeAlign().
@@ -2916,7 +2920,7 @@ void Compiler::fgInitArgInfo(GenTreeCall* call)
 #elif defined(TARGET_ARM64)
 
         assert(!callIsVararg || !isHfaArg);
-        passUsingFloatRegs = !callIsVararg && (isHfaArg || varTypeIsFloating(argx));
+        passUsingFloatRegs = !callIsVararg && (isHfaArg || varTypeUsesFloatReg(argx));
 
 #elif defined(TARGET_AMD64)
 
@@ -3295,7 +3299,7 @@ void Compiler::fgInitArgInfo(GenTreeCall* call)
             else if (isStructArg && structDesc.passedInRegisters)
             {
                 // It is a struct passed in registers. Assign the next available register.
-                assert((structDesc.eightByteCount <= 2) && "Too many eightbytes.");
+                assert(structDesc.eightByteCount <= CLR_SYSTEMV_MAX_EIGHTBYTES_COUNT_TO_PASS_IN_REGISTERS);
                 regNumber* nextRegNumPtrs[2] = {&nextRegNum, &nextOtherRegNum};
                 for (unsigned int i = 0; i < structDesc.eightByteCount; i++)
                 {
@@ -5533,7 +5537,7 @@ GenTree* Compiler::fgMorphArrayIndex(GenTree* tree)
 
     // If the index node is a floating-point type, notify the compiler
     // we'll potentially use floating point registers at the time of codegen.
-    if (varTypeIsFloating(tree->gtType))
+    if (varTypeUsesFloatReg(tree->gtType))
     {
         this->compFloatingPointUsed = true;
     }

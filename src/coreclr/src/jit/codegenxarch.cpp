@@ -173,7 +173,7 @@ void CodeGen::genEmitGSCookieCheck(bool pushReg)
             // returned in implicit RetBuf. If we reached here, we should not have
             // a RetBuf and the return type should not be a struct.
             assert(compiler->info.compRetBuffArg == BAD_VAR_NUM);
-            assert(!varTypeIsStruct(compiler->info.compRetNativeType));
+            assert(compiler->info.compRetNativeType != TYP_STRUCT);
 #endif // TARGET_AMD64
 
             // For x86 Windows we can't make such assertions since we generate code for returning of
@@ -1137,40 +1137,54 @@ void CodeGen::genSIMDSplitReturn(GenTree* src, ReturnTypeDesc* retTypeDesc)
 {
     assert(varTypeIsSIMD(src));
     assert(src->isUsedFromReg());
+    var_types retType  = retTypeDesc->GetReturnRegType(0);
+    unsigned  regCount = retTypeDesc->GetReturnRegCount();
+    regNumber opReg    = src->GetRegNum();
+    regNumber reg0     = retTypeDesc->GetABIReturnReg(0);
 
-    // This is a case of operand is in a single reg and needs to be
-    // returned in multiple ABI return registers.
-    regNumber opReg = src->GetRegNum();
-    regNumber reg0  = retTypeDesc->GetABIReturnReg(0);
-    regNumber reg1  = retTypeDesc->GetABIReturnReg(1);
-
-    if (opReg != reg0 && opReg != reg1)
+    // We either have a single register return of an opaque SIMD type,
+    // or we have a multiple register return of a fixed-size SIMD type.
+    if (regCount == 1)
     {
-        // Operand reg is different from return regs.
-        // Copy opReg to reg0 and let it to be handled by one of the
-        // two cases below.
-        inst_RV_RV(ins_Copy(TYP_DOUBLE), reg0, opReg, TYP_DOUBLE);
-        opReg = reg0;
-    }
-
-    if (opReg == reg0)
-    {
-        assert(opReg != reg1);
-
-        // reg0 - already has required 8-byte in bit position [63:0].
-        // reg1 = opReg.
-        // swap upper and lower 8-bytes of reg1 so that desired 8-byte is in bit position [63:0].
-        inst_RV_RV(ins_Copy(TYP_DOUBLE), reg1, opReg, TYP_DOUBLE);
+        assert(varTypeIsSIMD(retType));
+        if (opReg != reg0)
+        {
+            // Operand reg is different from return reg.
+            inst_RV_RV(ins_Copy(retType), reg0, opReg, retType);
+        }
     }
     else
     {
-        assert(opReg == reg1);
+        assert(regCount == 2);
+        regNumber reg1 = retTypeDesc->GetABIReturnReg(1);
+        if (opReg != reg0 && opReg != reg1)
+        {
+            // Operand reg is different from return regs.
+            // Copy opReg to reg0 and let it to be handled by one of the
+            // two cases below.
+            inst_RV_RV(ins_Copy(TYP_DOUBLE), reg0, opReg, TYP_DOUBLE);
+            opReg = reg0;
+        }
 
-        // reg0 = opReg.
-        // swap upper and lower 8-bytes of reg1 so that desired 8-byte is in bit position [63:0].
-        inst_RV_RV(ins_Copy(TYP_DOUBLE), reg0, opReg, TYP_DOUBLE);
+        if (opReg == reg0)
+        {
+            assert(opReg != reg1);
+
+            // reg0 - already has required 8-byte in bit position [63:0].
+            // reg1 = opReg.
+            // swap upper and lower 8-bytes of reg1 so that desired 8-byte is in bit position [63:0].
+            inst_RV_RV(ins_Copy(TYP_DOUBLE), reg1, opReg, TYP_DOUBLE);
+        }
+        else
+        {
+            assert(opReg == reg1);
+
+            // reg0 = opReg.
+            // swap upper and lower 8-bytes of reg1 so that desired 8-byte is in bit position [63:0].
+            inst_RV_RV(ins_Copy(TYP_DOUBLE), reg0, opReg, TYP_DOUBLE);
+        }
+        inst_RV_RV_IV(INS_shufpd, EA_16BYTE, reg1, reg1, 0x01);
     }
-    inst_RV_RV_IV(INS_shufpd, EA_16BYTE, reg1, reg1, 0x01);
 }
 #endif // FEATURE_SIMD
 
@@ -4810,10 +4824,10 @@ void CodeGen::genCodeForSwap(GenTreeOp* tree)
     var_types            type2   = varDsc2->TypeGet();
 
     // We must have both int or both fp regs
-    assert(!varTypeIsFloating(type1) || varTypeIsFloating(type2));
+    assert(!varTypeUsesFloatReg(type1) || varTypeUsesFloatReg(type2));
 
     // FP swap is not yet implemented (and should have NYI'd in LSRA)
-    assert(!varTypeIsFloating(type1));
+    assert(!varTypeUsesFloatReg(type1));
 
     regNumber oldOp1Reg     = lcl1->GetRegNum();
     regMaskTP oldOp1RegMask = genRegMask(oldOp1Reg);
@@ -4997,7 +5011,7 @@ void CodeGen::genCallInstruction(GenTreeCall* call)
                 genConsumeReg(putArgRegNode);
 
                 // Validate the putArgRegNode has the right type.
-                assert(varTypeIsFloating(putArgRegNode->TypeGet()) == genIsValidFloatReg(argReg));
+                assert(varTypeUsesFloatReg(putArgRegNode->TypeGet()) == genIsValidFloatReg(argReg));
                 if (putArgRegNode->GetRegNum() != argReg)
                 {
                     inst_RV_RV(ins_Move_Extend(putArgRegNode->TypeGet(), false), argReg, putArgRegNode->GetRegNum());
@@ -5020,6 +5034,7 @@ void CodeGen::genCallInstruction(GenTreeCall* call)
         // the ABI dictates that if we have floating point args,
         // we must pass the enregistered arguments in both the
         // integer and floating point registers so, let's do that.
+        // TODO: How are vector args handled?
         if (call->IsVarargs() && varTypeIsFloating(argNode))
         {
             regNumber   targetReg = compiler->getCallArgIntRegister(argNode->GetRegNum());
@@ -5136,7 +5151,7 @@ void CodeGen::genCallInstruction(GenTreeCall* call)
     }
     else
     {
-        assert(!varTypeIsStruct(call));
+        assert(!call->TypeIs(TYP_STRUCT));
 
         if (call->gtType == TYP_REF)
         {
@@ -5433,7 +5448,7 @@ void CodeGen::genCallInstruction(GenTreeCall* call)
                 }
                 else
 #endif // TARGET_X86
-                    if (varTypeIsFloating(returnType))
+                    if (varTypeUsesFloatReg(returnType))
                 {
                     returnReg = REG_FLOATRET;
                 }
@@ -5747,6 +5762,7 @@ void CodeGen::genJmpMethod(GenTree* jmp)
             var_types loadType = varDsc->lvaArgType();
             regNumber argReg   = varDsc->GetArgReg(); // incoming arg register
 
+            // TODO: How are varargs methods with vector args handled on x64/ux?
             if (varTypeIsFloating(loadType))
             {
                 intArgReg       = compiler->getCallArgIntRegister(argReg);
@@ -7063,9 +7079,9 @@ void CodeGen::genIntrinsic(GenTree* treeNode)
 //
 void CodeGen::genBitCast(var_types targetType, regNumber targetReg, var_types srcType, regNumber srcReg)
 {
-    const bool srcFltReg = varTypeIsFloating(srcType) || varTypeIsSIMD(srcType);
+    const bool srcFltReg = varTypeUsesFloatReg(srcType);
     assert(srcFltReg == genIsValidFloatReg(srcReg));
-    const bool dstFltReg = varTypeIsFloating(targetType) || varTypeIsSIMD(targetType);
+    const bool dstFltReg = varTypeUsesFloatReg(targetType);
     assert(dstFltReg == genIsValidFloatReg(targetReg));
     if (srcFltReg != dstFltReg)
     {
@@ -7816,7 +7832,7 @@ void CodeGen::genStoreRegToStackArg(var_types type, regNumber srcReg, int offset
         else
 #endif // TARGET_X86
         {
-            assert((varTypeIsFloating(type) && genIsValidFloatReg(srcReg)) ||
+            assert((varTypeUsesFloatReg(type) && genIsValidFloatReg(srcReg)) ||
                    (varTypeIsIntegralOrI(type) && genIsValidIntReg(srcReg)));
             ins = ins_Store(type);
         }
@@ -8751,6 +8767,7 @@ void CodeGen::genProfilingEnterCallback(regNumber initReg, bool* pInitRegModifie
         GetEmitter()->emitIns_R_S(load_ins, emitTypeSize(loadType), argReg, varNum, 0);
 
 #if FEATURE_VARARG
+        // TODO: How should register-passed vector args be handled?
         if (compiler->info.compIsVarArgs && varTypeIsFloating(loadType))
         {
             regNumber   intArgReg = compiler->getCallArgIntRegister(argReg);

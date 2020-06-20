@@ -1130,7 +1130,7 @@ GenTree* Lowering::NewPutArg(GenTreeCall* call, GenTree* arg, fgArgTabEntry* inf
                 }
                 var_types regType = use.GetNode()->TypeGet();
                 // Account for the possibility that float fields may be passed in integer registers.
-                if (varTypeIsFloating(regType) && !genIsValidFloatReg(argSplit->GetRegNumByIdx(regIndex)))
+                if (varTypeUsesFloatReg(regType) && !genIsValidFloatReg(argSplit->GetRegNumByIdx(regIndex)))
                 {
                     regType = (regType == TYP_FLOAT) ? TYP_INT : TYP_LONG;
                 }
@@ -1359,17 +1359,6 @@ void Lowering::LowerArg(GenTreeCall* call, GenTree** ppArg)
             }
         }
     }
-#elif defined(TARGET_AMD64)
-    // TYP_SIMD8 parameters that are passed as longs
-    if (type == TYP_SIMD8 && genIsValidIntReg(info->GetRegNum()))
-    {
-        GenTreeUnOp* bitcast = new (comp, GT_BITCAST) GenTreeOp(GT_BITCAST, TYP_LONG, arg, nullptr);
-        BlockRange().InsertAfter(arg, bitcast);
-
-        *ppArg = arg = bitcast;
-        assert(info->GetNode() == arg);
-        type = TYP_LONG;
-    }
 #endif // defined(TARGET_X86)
 #endif // defined(FEATURE_SIMD)
 
@@ -1412,6 +1401,18 @@ void Lowering::LowerArg(GenTreeCall* call, GenTree** ppArg)
     else
 #endif // !defined(TARGET_64BIT)
     {
+        if (info->isPassedInRegisters() && (info->argType != TYP_STRUCT) &&
+            (varTypeUsesFloatReg(type) != genIsValidFloatReg(info->GetRegNum())))
+        {
+            var_types argType = info->argType;
+            assert(genIsValidFloatReg(info->GetRegNum()) == varTypeUsesFloatReg(argType));
+            GenTreeUnOp* bitcast = new (comp, GT_BITCAST) GenTreeOp(GT_BITCAST, argType, arg, nullptr);
+            BlockRange().InsertAfter(arg, bitcast);
+
+            *ppArg = arg = bitcast;
+            assert(info->GetNode() == arg);
+            type = argType;
+        }
 
 #ifdef TARGET_ARMARCH
         if (call->IsVarargs() || comp->opts.compUseSoftFP)
@@ -3402,7 +3403,7 @@ void Lowering::LowerCallStruct(GenTreeCall* call)
     }
 #endif // FEATURE_HFA
 
-    assert(!comp->compDoOldStructRetyping());
+    assert(!comp->compDoOldStructRetyping() || varTypeIsSIMD(call));
     CORINFO_CLASS_HANDLE        retClsHnd = call->gtRetClsHnd;
     Compiler::structPassingKind howToReturnStruct;
     var_types                   returnType = comp->getReturnTypeForStruct(retClsHnd, &howToReturnStruct);
@@ -3414,6 +3415,18 @@ void Lowering::LowerCallStruct(GenTreeCall* call)
     if (BlockRange().TryGetUse(call, &callUse))
     {
         GenTree* user = callUse.User();
+#ifdef UNIX_AMD64_ABI
+        // At this point if we have a SIMD type it will be returned in a register.
+        // TODO-X64-Windows: This code will eventually handle both Windows and Linux,
+        // and the code below can be simplified.
+        var_types userType = user->TypeGet();
+        assert(!varTypeIsSIMD(userType) || (userType == returnType));
+        if (varTypeIsSIMD(returnType) && (userType != returnType))
+        {
+            assert(userType == TYP_STRUCT);
+            user->gtType = returnType;
+        }
+#endif
         switch (user->OperGet())
         {
             case GT_RETURN:

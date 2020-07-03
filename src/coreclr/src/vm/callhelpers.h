@@ -22,6 +22,7 @@ struct CallDescrData
     const ArgumentRegisters *   pArgumentRegisters;
 #endif
 #ifdef CALLDESCR_FPARGREGS
+    BOOL                           fAVXSupported;
     const FloatArgumentRegisters * pFloatArgumentRegisters;
 #endif
 #ifdef CALLDESCR_REGTYPEMAP

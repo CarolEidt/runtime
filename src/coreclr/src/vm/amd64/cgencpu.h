@@ -67,8 +67,8 @@ EXTERN_C void FastCallFinalizeWorker(Object *obj, PCODE funcPtr);
 
 #ifdef UNIX_AMD64_ABI
 #define ENREGISTERED_RETURNTYPE_INTEGER_MAXSIZE 16   // bytes
-#define ENREGISTERED_PARAMTYPE_MAXSIZE          16   // bytes
-#define ENREGISTERED_RETURNTYPE_MAXSIZE         16   // bytes
+#define ENREGISTERED_PARAMTYPE_MAXSIZE          32   // bytes
+#define ENREGISTERED_RETURNTYPE_MAXSIZE         32   // bytes
 #define CALLDESCR_ARGREGS                       1    // CallDescrWorker has ArgumentRegister parameter
 #define CALLDESCR_FPARGREGS                     1    // CallDescrWorker has FloatArgumentRegisters parameter
 #else
@@ -261,7 +261,7 @@ struct CalleeSavedRegistersPointers {
 
 typedef DPTR(struct FloatArgumentRegisters) PTR_FloatArgumentRegisters;
 struct FloatArgumentRegisters {
-     M128A d[NUM_FLOAT_ARGUMENT_REGISTERS];   // xmm0-xmm7
+     M128A d[NUM_FLOAT_ARGUMENT_REGISTERS * 2];   // ymm0-ymm7
 };
 #else
 // Windows x64 calling convention uses 4 registers for floating point data

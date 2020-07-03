@@ -619,8 +619,8 @@ public:
 
         if (TransitionBlock::IsFloatArgumentRegisterOffset(argOffset))
         {
-            // Dividing by 16 as size of each register in FloatArgumentRegisters is 16 bytes.
-            pLoc->m_idxFloatReg = (argOffset - TransitionBlock::GetOffsetOfFloatArgumentRegisters()) / 16;
+            // Dividing by 32 as size of each register in FloatArgumentRegisters is up to 32 bytes.
+            pLoc->m_idxFloatReg = (argOffset - TransitionBlock::GetOffsetOfFloatArgumentRegisters()) / 32;
 
             if (!m_argTypeHandle.IsNull() && m_argTypeHandle.IsHFA())
             {
@@ -690,8 +690,8 @@ public:
 #if defined(UNIX_AMD64_ABI)
         if (TransitionBlock::IsFloatArgumentRegisterOffset(argOffset))
         {
-            // Dividing by 16 as size of each register in FloatArgumentRegisters is 16 bytes.
-            pLoc->m_idxFloatReg = (argOffset - TransitionBlock::GetOffsetOfFloatArgumentRegisters()) / 16;
+            // Dividing by 32 as size of each register in FloatArgumentRegisters is up to 32 bytes.
+            pLoc->m_idxFloatReg = (argOffset - TransitionBlock::GetOffsetOfFloatArgumentRegisters()) / 32;
             pLoc->m_cFloatReg = 1;
         }
         else 
@@ -1095,6 +1095,9 @@ int ArgIteratorTemplate<ARGITERATOR_BASE>::GetNextOffset()
                         break;
                     case SystemVClassificationTypeSSE:
                         cFPRegs++;
+                        break;
+                    case SystemVClassificationTypeSSEUp:
+                        // No additional register used.
                         break;
                     default:
                         _ASSERTE(false);

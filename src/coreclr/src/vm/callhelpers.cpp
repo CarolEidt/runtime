@@ -450,6 +450,7 @@ void MethodDescCallSite::CallTargetWorker(const ARG_SLOT *pArguments, ARG_SLOT *
             if (TransitionBlock::HasFloatRegister(ofs, m_argIt.GetArgLocDescForStructInRegs()) &&
                 (pFloatArgumentRegisters == NULL))
             {
+                fAVXSupported = TargetHasAVXSupport();
                 pFloatArgumentRegisters = (FloatArgumentRegisters*)(pTransitionBlock +
                                                                     TransitionBlock::GetOffsetOfFloatArgumentRegisters());
             }

@@ -98,7 +98,7 @@ public:
     {
         LIMITED_METHOD_CONTRACT;
         _ASSERTE(IsStructPassedInRegs());
-        int offset = TransitionBlock::GetOffsetOfFloatArgumentRegisters() + m_argLocDescForStructInRegs->m_idxFloatReg * 16;
+        int offset = TransitionBlock::GetOffsetOfFloatArgumentRegisters() + m_argLocDescForStructInRegs->m_idxFloatReg * 32;
         return dac_cast<PTR_VOID>(dac_cast<TADDR>(m_base) + offset);
     }
 
@@ -167,7 +167,8 @@ public:
 
             _ASSERTE(remainingBytes >= eightByteSize);
 
-            if (eightByteClassification == SystemVClassificationTypeSSE)
+            if ((eightByteClassification == SystemVClassificationTypeSSE) ||
+                (eightByteClassification == SystemVClassificationTypeSSEUp))
             {
                 if (eightByteSize == 8)
                 {

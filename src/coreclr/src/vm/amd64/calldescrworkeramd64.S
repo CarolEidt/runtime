@@ -86,14 +86,30 @@ LOCAL_LABEL(NoStackArguments):
         mov     rax, [rbx + CallDescrData__pFloatArgumentRegisters]
         and     rax, rax
         jz      LOCAL_LABEL(NoFloatArguments)
-        movsd   xmm0, [rax + 0]
-        movsd   xmm1, [rax + 16]
-        movsd   xmm2, [rax + 32]
-        movsd   xmm3, [rax + 48]
-        movsd   xmm4, [rax + 64]
-        movsd   xmm5, [rax + 80]
-        movsd   xmm6, [rax + 96]
-        movsd   xmm7, [rax + 112]
+
+        // Check whether AVX is supported
+        mov     rcx, [rbx + CallDescrData__fAVXSupported]
+        test    rcx, rcx
+        jz      LOCAL_LABEL(NoAVX)
+        vmovupd ymm0, [rax + 0]
+        vmovupd ymm1, [rax + 32]
+        vmovupd ymm2, [rax + 64]
+        vmovupd ymm3, [rax + 96]
+        vmovupd ymm4, [rax + 128]
+        vmovupd ymm5, [rax + 160]
+        vmovupd ymm6, [rax + 192]
+        vmovupd ymm7, [rax + 224]
+
+LOCAL_LABEL(NoAVX):
+        movupd  xmm0, [rax + 0]
+        movupd  xmm1, [rax + 32]
+        movupd  xmm2, [rax + 64]
+        movupd  xmm3, [rax + 96]
+        movupd  xmm4, [rax + 128]
+        movupd  xmm5, [rax + 160]
+        movupd  xmm6, [rax + 192]
+        movupd  xmm7, [rax + 224]
+
 LOCAL_LABEL(NoFloatArguments):
         call    qword ptr [rbx + CallDescrData__pTarget]     // call target function
 

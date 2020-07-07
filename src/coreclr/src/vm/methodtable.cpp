@@ -2660,6 +2660,13 @@ bool MethodTable::ClassifyEightBytesWithNativeLayout(SystemVStructRegisterPassin
         nestingLevel * 5, "", this->GetDebugClassName(), this, startOffsetOfStruct, helperPtr->structSize));
 #endif // _DEBUG
 
+    // If we have a struct larger than 16 bytes, the only way it will be supported is if it is
+    // a 32-byte vector or a struct with a single 32-byte vector field.
+    if ((helperPtr->structSize > 0x10) && (numIntroducedFields != 1))
+    {
+        return false;
+    }
+
     for (unsigned int fieldIndex = 0; fieldIndex < numIntroducedFields; fieldIndex++)
     {
         const NativeFieldDescriptor* pNFD;

@@ -204,6 +204,7 @@ void * DispatchCallSimple(
 #endif
 
 #ifdef CALLDESCR_FPARGREGS
+    callDescrData.fAVXSupported = FALSE;
     callDescrData.pFloatArgumentRegisters = NULL;
 #endif
 #ifdef CALLDESCR_REGTYPEMAP
@@ -301,6 +302,7 @@ void MethodDescCallSite::CallTargetWorker(const ARG_SLOT *pArguments, ARG_SLOT *
     UINT64 dwRegTypeMap;
 #endif
 #ifdef CALLDESCR_FPARGREGS
+    BOOL fAVXSupported = FALSE;
     FloatArgumentRegisters *pFloatArgumentRegisters = NULL;
 #endif
     void*  pvRetBuff = NULL;
@@ -524,6 +526,7 @@ void MethodDescCallSite::CallTargetWorker(const ARG_SLOT *pArguments, ARG_SLOT *
     callDescrData.pRetBuffArg = (UINT64*)(pTransitionBlock + TransitionBlock::GetOffsetOfRetBuffArgReg());
 #endif
 #ifdef CALLDESCR_FPARGREGS
+    callDescrData.fAVXSupported = fAVXSupported;
     callDescrData.pFloatArgumentRegisters = pFloatArgumentRegisters;
 #endif
 #ifdef CALLDESCR_REGTYPEMAP

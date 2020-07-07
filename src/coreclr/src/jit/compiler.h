@@ -9121,9 +9121,9 @@ public:
     // 4 or 8 gets normalized to TYP_BYTE/TYP_SHORT/TYP_INT/TYP_LONG; On Arm HFA structs).
     // Methods returning such structs are considered to return non-struct return value and
     // this method returns true in that case.
-    bool compMethodReturnsNativeScalarType()
+    bool compMethodReturnsSingleRegType()
     {
-        return (info.compRetType != TYP_VOID) && !varTypeIsStruct(info.compRetNativeType);
+        return ((info.compRetType != TYP_VOID) && (info.compRetNativeType != TYP_STRUCT));
     }
 
     // Returns true if the method being compiled returns RetBuf addr as its return value
@@ -9216,7 +9216,7 @@ public:
     // Returns true if the method being compiled returns a value
     bool compMethodHasRetVal()
     {
-        return compMethodReturnsNativeScalarType() || compMethodReturnsRetBufAddr() ||
+        return compMethodReturnsSingleRegType() || compMethodReturnsRetBufAddr() ||
                compMethodReturnsMultiRegRetType();
     }
 

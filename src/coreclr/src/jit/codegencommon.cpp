@@ -3448,7 +3448,6 @@ void CodeGen::genFnPrologCalleeRegArgs(regNumber xtraReg, bool* pXtraRegClobbere
             unsigned firstRegSlot = 0;
             for (unsigned slotCounter = 0; slotCounter < structDesc.eightByteCount; slotCounter++)
             {
-                regNumber regNum = varDsc->lvRegNumForSlot(slotCounter);
                 var_types regType;
 
 #ifdef FEATURE_SIMD
@@ -3496,6 +3495,7 @@ void CodeGen::genFnPrologCalleeRegArgs(regNumber xtraReg, bool* pXtraRegClobbere
                     regType = compiler->GetEightByteType(structDesc, slotCounter);
                 }
 
+                regNumber regNum = varDsc->lvRegNumForSlot(slotCounter);
                 regArgNum = genMapRegNumToRegArgNum(regNum, regType);
 
                 if ((!doingFloat && (structDesc.IsIntegralSlot(slotCounter))) ||
@@ -11671,7 +11671,7 @@ void CodeGen::genStructReturn(GenTree* treeNode)
     {
         varDsc = compiler->lvaGetDesc(actualOp1->AsLclVar()->GetLclNum());
         retTypeDesc.InitializeStructReturnType(compiler, varDsc->lvVerTypeInfo.GetClassHandle());
-        assert(varDsc->lvIsMultiRegRet);
+        assert(varDsc->lvIsMultiRegRet || varTypeIsSIMD(compiler->info.compRetNativeType));
     }
     else
     {
@@ -11695,7 +11695,7 @@ void CodeGen::genStructReturn(GenTree* treeNode)
     {
         GenTreeLclVar* lclNode = actualOp1->AsLclVar();
         LclVarDsc*     varDsc  = compiler->lvaGetDesc(lclNode->GetLclNum());
-        assert(varDsc->lvIsMultiRegRet);
+        assert(varDsc->lvIsMultiRegRet || (regCount == 1));
         int offset = 0;
         for (unsigned i = 0; i < regCount; ++i)
         {

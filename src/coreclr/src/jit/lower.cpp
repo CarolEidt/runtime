@@ -6309,13 +6309,15 @@ void Lowering::ContainCheckRet(GenTreeUnOp* ret)
     if (varTypeIsStruct(ret))
     {
         GenTree* op1 = ret->gtGetOp1();
-        // op1 must be either a lclvar or a multi-reg returning call
+        // op1 must be either a lclvar or a call returned in one or more registers.
         if (op1->OperGet() == GT_LCL_VAR)
         {
             GenTreeLclVarCommon* lclVarCommon = op1->AsLclVarCommon();
             LclVarDsc*           varDsc       = &(comp->lvaTable[lclVarCommon->GetLclNum()]);
-            // This must be a multi-reg return or an HFA of a single element.
-            assert(varDsc->lvIsMultiRegRet || (varDsc->lvIsHfa() && varTypeIsValidHfaType(varDsc->lvType)));
+            // This must be a multi-reg return, a SIMD type or an HFA of a single element.
+            // Note that the returned variable may be TYP_STRUCT even if it's returned as a SIMD type.
+            assert(varDsc->lvIsMultiRegRet || varTypeIsSIMD(comp->info.compRetNativeType) ||
+                   (varDsc->lvIsHfa() && varTypeIsValidHfaType(varDsc->lvType)));
 
             // Mark var as contained if not enregisterable.
             if (!varTypeIsEnregisterable(op1))

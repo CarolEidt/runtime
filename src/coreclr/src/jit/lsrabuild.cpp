@@ -2221,14 +2221,18 @@ void LinearScan::buildIntervals()
 
         bool predBlockIsAllocated = false;
         predBlock                 = findPredBlockForLiveIn(block, prevBlock DEBUGARG(&predBlockIsAllocated));
+        unsigned predBBNum        = 0;
         if (predBlock != nullptr)
         {
-            JITDUMP("\n\nSetting " FMT_BB " as the predecessor for determining incoming variable registers of " FMT_BB
-                    "\n",
-                    predBlock->bbNum, block->bbNum);
-            assert(predBlock->bbNum <= bbNumMaxBeforeResolution);
-            blockInfo[block->bbNum].predBBNum = predBlock->bbNum;
+            predBBNum = predBlock->bbNum;
+            JITDUMP("\n\nSetting " FMT_BB,  predBBNum);
         }
+        else
+        {
+            JITDUMP("\n\nSetting NO block");
+        }
+        JITDUMP(" as the predecessor for determining incoming variable registers of " FMT_BB "\n", block->bbNum);
+        blockInfo[block->bbNum].predBBNum = predBBNum;
 
         if (enregisterLocalVars)
         {

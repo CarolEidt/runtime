@@ -627,6 +627,9 @@ LinearScan::LinearScan(Compiler* theCompiler)
     : compiler(theCompiler)
     , intervals(theCompiler->getAllocator(CMK_LSRA_Interval))
     , allocationPassComplete(false)
+    , criticalEdgeResolutionComplete(false)
+    , criticalEdgeSetCount(0)
+    , criticalEdgeSets(theCompiler->getAllocator(CMK_LSRA))
     , refPositions(theCompiler->getAllocator(CMK_LSRA_RefPosition))
     , listNodePool(theCompiler)
 {
@@ -783,6 +786,101 @@ BasicBlock* LinearScan::getNextCandidateFromWorkList()
 }
 
 //------------------------------------------------------------------------
+// mergeCriticalInSets: Merge the CriticalEdgeSets for this block's incoming edges
+//
+// Arguments:
+//    block - the block of interest
+//
+// Return Value:
+//    None
+//
+// Notes:
+//    This block must have at least one incoming critical edge.
+//
+void
+LinearScan::mergeCriticalInSets(BasicBlock* block)
+{
+    LsraBlockInfo* thisBlockInfo = &blockInfo[block->bbNum];
+    CriticalEdgeSetIndex index = thisBlockInfo->criticalInEdgeIndex;
+    CriticalEdgeSet* edgeSet = getCriticalEdgeSet(index);
+    for (flowList* pred = block->bbPreds; pred != nullptr; pred = pred->flNext)
+    {
+        BasicBlock* predBlock = pred->flBlock;
+        if (isBlockVisited(predBlock) && (predBlock->NumSucc(compiler) > 1) && !VarSetOps::IsEmpty(compiler, predBlock->bbLiveOut))
+        {
+            LsraBlockInfo* predBlockInfo = &blockInfo[predBlock->bbNum];
+            // This is a critical edge. Either its out set has the same index as this, or a higher one,
+            // and we will either merge that into the current set, or it has already been merged.
+            CriticalEdgeSetIndex predIndex = predBlockInfo->criticalOutEdgeIndex;
+            if (predIndex == index)
+            {
+                assert(edgeSet->outEdgeContains(predBlock));
+                continue;
+            }
+
+            // This must be a valid set.
+            assert((predIndex != CriticalEdgeSetInvalid) && (predIndex > index));
+            CriticalEdgeSet* predSet = getCriticalEdgeSet(predIndex);
+            assert(predSet->isValid);
+
+            // Merge predSet into edgeSet, and mark it invalid.
+            mergeCriticalEdgeSets(edgeSet, predSet);
+        }
+    }
+}
+
+//------------------------------------------------------------------------
+// mergeCriticalOutSets: Merge the CriticalEdgeSets for this block's outgoing edges
+//
+// Arguments:
+//    block - the block of interest
+//
+// Return Value:
+//    None
+//
+// Notes:
+//    This block must have at least one outgoing critical edge.
+//
+void
+LinearScan::mergeCriticalOutSets(BasicBlock* block)
+{
+    LsraBlockInfo* thisBlockInfo = &blockInfo[block->bbNum];
+    CriticalEdgeSetIndex index = thisBlockInfo->criticalOutEdgeIndex;
+    CriticalEdgeSet* edgeSet = getCriticalEdgeSet(index);
+    const unsigned numSuccs = block->NumSucc(compiler);
+    for (unsigned succIndex = 0; succIndex < numSuccs; succIndex++)
+    {
+        BasicBlock* succBlock = block->GetSucc(succIndex, compiler);
+        if (isBlockVisited(succBlock) && (succBlock->GetUniquePred(compiler) == nullptr) && !VarSetOps::IsEmpty(compiler, succBlock->bbLiveIn))
+        {
+            LsraBlockInfo* succBlockInfo = &blockInfo[succBlock->bbNum];
+            // This is a critical edge. Either its out set has the same index as this, or a higher one,
+            // and we will either merge that into the current set, or it has already been merged.
+            CriticalEdgeSetIndex succIndex = succBlockInfo->criticalInEdgeIndex;
+            if (succIndex == index)
+            {
+                assert(edgeSet->inEdgeContains(succBlock));
+                continue;
+            }
+
+            // This must be a valid set, and greater than or equal to this index.
+            assert((succIndex != CriticalEdgeSetInvalid) && (succIndex >= index));
+
+            // This edge may already be in the same set.
+            if (succIndex == index)
+            {
+                continue;
+            }
+
+            // Merge succSet into edgeSet, and mark it invalid.
+            CriticalEdgeSet* succSet = getCriticalEdgeSet(succIndex);
+            assert(succSet->isValid);
+            mergeCriticalEdgeSets(edgeSet, succSet);
+        }
+    }
+}
+
+//------------------------------------------------------------------------
 // setBlockSequence: Determine the block order for register allocation.
 //
 // Arguments:
@@ -814,8 +912,7 @@ void LinearScan::setBlockSequence()
 
     assert(blockSequence == nullptr && bbSeqCount == 0);
     blockSequence            = new (compiler, CMK_LSRA) BasicBlock*[compiler->fgBBcount];
-    bbNumMaxBeforeResolution = compiler->fgBBNumMax;
-    blockInfo                = new (compiler, CMK_LSRA) LsraBlockInfo[bbNumMaxBeforeResolution + 1];
+    blockInfo                = new (compiler, CMK_LSRA) LsraBlockInfo[compiler->fgBBNumMax + 1];
 
     assert(blockSequenceWorkList == nullptr);
 
@@ -828,91 +925,174 @@ void LinearScan::setBlockSequence()
     blockInfo[0].weight = BB_UNITY_WEIGHT;
     for (BasicBlock* block = compiler->fgFirstBB; block != nullptr; block = nextBlock)
     {
-        blockSequence[bbSeqCount] = block;
-        markBlockVisited(block);
-        bbSeqCount++;
+        bool misMatch = false;
+        CriticalEdgeSetIndex criticalInEdgeIndex = CriticalEdgeSetInvalid;
+        CriticalEdgeSetIndex criticalOutEdgeIndex = CriticalEdgeSetInvalid;
+        unsigned thisBBSeqCount = bbSeqCount++;
+        blockSequence[thisBBSeqCount] = block;
         nextBlock = nullptr;
 
         // Initialize the blockInfo.
         // predBBNum will be set later.
         // 0 is never used as a bbNum, but is used in blockInfo to designate an exception entry block.
-        blockInfo[block->bbNum].predBBNum = 0;
+        LsraBlockInfo* thisBlockInfo = &(blockInfo[block->bbNum]);
         // We check for critical edges below, but initialize to false.
-        blockInfo[block->bbNum].hasCriticalInEdge  = false;
-        blockInfo[block->bbNum].hasCriticalOutEdge = false;
-        blockInfo[block->bbNum].weight             = block->getBBWeight(compiler);
-        blockInfo[block->bbNum].hasEHBoundaryIn    = block->hasEHBoundaryIn();
-        blockInfo[block->bbNum].hasEHBoundaryOut   = block->hasEHBoundaryOut();
-        blockInfo[block->bbNum].hasEHPred          = false;
+        thisBlockInfo->criticalInEdgeIndex = CriticalEdgeSetInvalid;
+        thisBlockInfo->criticalOutEdgeIndex = CriticalEdgeSetInvalid;
+        thisBlockInfo->weight             = block->getBBWeight(compiler);
+        thisBlockInfo->hasEHBoundaryIn    = block->hasEHBoundaryIn();
+        thisBlockInfo->hasEHBoundaryOut   = block->hasEHBoundaryOut();
 
 #if TRACK_LSRA_STATS
-        blockInfo[block->bbNum].spillCount         = 0;
-        blockInfo[block->bbNum].copyRegCount       = 0;
-        blockInfo[block->bbNum].resolutionMovCount = 0;
-        blockInfo[block->bbNum].splitEdgeCount     = 0;
+        thisBlockInfo->spillCount         = 0;
+        thisBlockInfo->copyRegCount       = 0;
+        thisBlockInfo->resolutionMovCount = 0;
+        thisBlockInfo->splitEdgeCount     = 0;
 #endif // TRACK_LSRA_STATS
 
         bool hasUniquePred = (block->GetUniquePred(compiler) != nullptr);
-        for (flowList* pred = block->bbPreds; pred != nullptr; pred = pred->flNext)
+        if ((compiler->compHndBBtabCount > 0))
         {
-            BasicBlock* predBlock = pred->flBlock;
-            if (!hasUniquePred)
+            for (flowList* pred = block->bbPreds; pred != nullptr; pred = pred->flNext)
             {
+                BasicBlock* predBlock = pred->flBlock;
+                if (((predBlock->bbFlags & BBF_KEEP_BBJ_ALWAYS) != 0) || (hasUniquePred && predBlock->hasEHBoundaryOut()))
+                {
+                    // Treat this as having incoming EH flow, since we can't insert resolution moves into
+                    // the ALWAYS block of a BBCallAlwaysPair, and a unique pred with an EH out edge won't
+                    // allow us to keep any variables enregistered.
+                    thisBlockInfo->hasEHBoundaryIn = true;
+                }
+
+            }
+        }
+
+        CriticalEdgeSetIndex newIndex = criticalEdgeSetCount; // The index *if* we create a new set.
+        if (!VarSetOps::IsEmpty(compiler, block->bbLiveIn) && block->GetUniquePred(compiler) == nullptr)
+        {
+            CriticalEdgeSetIndex newIndex = criticalEdgeSetCount; // The index *if* we create a new set.
+            for (flowList* pred = block->bbPreds; pred != nullptr; pred = pred->flNext)
+            {
+                BasicBlock* predBlock = pred->flBlock;
+                LsraBlockInfo* predBlockInfo = &blockInfo[predBlock->bbNum];
                 if (predBlock->NumSucc(compiler) > 1)
                 {
-                    blockInfo[block->bbNum].hasCriticalInEdge = true;
-                    hasCriticalEdges                          = true;
+                    if (!VarSetOps::IsEmpty(compiler, predBlock->bbLiveOut))
+                    {
+                        // This is a critical edge.
+                        hasCriticalEdges = true;
+
+                        if (thisBlockInfo->criticalInEdgeIndex == CriticalEdgeSetInvalid)
+                        {
+                            // We *may* need to create a new set.
+                            thisBlockInfo->criticalInEdgeIndex = newIndex;
+                        }
+                        if (isBlockVisited(predBlock) && predBlockInfo->criticalOutEdgeIndex != CriticalEdgeSetInvalid)
+                        {
+                            if (predBlockInfo->criticalOutEdgeIndex < thisBlockInfo->criticalInEdgeIndex)
+                            {
+                                // We use this lower numbered set.
+                                if (thisBlockInfo->criticalInEdgeIndex != newIndex)
+                                {
+                                    // We had already found another existing set; we have a mis-match.
+                                    misMatch = true;
+                                }
+                                thisBlockInfo->criticalInEdgeIndex = predBlockInfo->criticalOutEdgeIndex;
+                            }
+                            else if (predBlockInfo->criticalOutEdgeIndex != thisBlockInfo->criticalInEdgeIndex)
+                            {
+                                // We have a mismatch, but we don't want to change predBlockInfo, because we need
+                                // to merge its set with the final one we settle on.
+                                misMatch = true;
+                            }
+                        }
+                        // Either the predecessor:
+                        // - has not yet been visited (in which case we'll add it later), or
+                        // - was a mismatch and will merge it below, or
+                        // - was already in the current set.
+                        assert(!isBlockVisited(predBlock) || misMatch ||
+                            (predBlockInfo->criticalOutEdgeIndex == thisBlockInfo->criticalInEdgeIndex));
+                    }
                 }
                 else if (predBlock->bbJumpKind == BBJ_SWITCH)
                 {
                     assert(!"Switch with single successor");
                 }
             }
-
-            // We treat BBCallAlwaysPairTail blocks as having EH flow, since we can't
-            // insert resolution moves into those blocks.
-            if (block->isBBCallAlwaysPairTail())
+            if (thisBlockInfo->criticalInEdgeIndex != CriticalEdgeSetInvalid)
             {
-                blockInfo[block->bbNum].hasEHBoundaryIn  = true;
-                blockInfo[block->bbNum].hasEHBoundaryOut = true;
+                Compiler::BlockListNode* inEdgeListNode = new (compiler) Compiler::BlockListNode(block);
+                if (thisBlockInfo->criticalInEdgeIndex == newIndex)
+                {
+                    // We need to actually allocate this new set.
+                    makeNewCriticalEdgeSet(newIndex, block);
+                }
+                // Add this edge to the criticalInEdgeIndex set.
+                CriticalEdgeSet* edgeSet = getCriticalEdgeSet(thisBlockInfo->criticalInEdgeIndex);
+                edgeSet->addToInEdges(inEdgeListNode);
             }
-            else if (predBlock->hasEHBoundaryOut() || predBlock->isBBCallAlwaysPairTail())
+
+            if (misMatch)
             {
-                if (hasUniquePred)
-                {
-                    // A unique pred with an EH out edge won't allow us to keep any variables enregistered.
-                    blockInfo[block->bbNum].hasEHBoundaryIn = true;
-                }
-                else
-                {
-                    blockInfo[block->bbNum].hasEHPred = true;
-                }
+                // Traverse all preds again, updating and merging the sets.
+                mergeCriticalInSets(block);
             }
         }
+        markBlockVisited(block);
 
         // Determine which block to schedule next.
 
         // First, update the NORMAL successors of the current block, adding them to the worklist
         // according to the desired order.  We will handle the EH successors below.
-        bool checkForCriticalOutEdge = (block->NumSucc(compiler) > 1);
-        if (!checkForCriticalOutEdge && block->bbJumpKind == BBJ_SWITCH)
-        {
-            assert(!"Switch with single successor");
-        }
-
         const unsigned numSuccs = block->NumSucc(compiler);
+        assert((numSuccs > 1) || !(block->bbJumpKind == BBJ_SWITCH));
+        bool checkForCriticalOutEdge = ((numSuccs > 1) && !VarSetOps::IsEmpty(compiler, block->bbLiveOut));
+
+        misMatch = false;
+        newIndex = criticalEdgeSetCount; // The index *if* we create a new set.
         for (unsigned succIndex = 0; succIndex < numSuccs; succIndex++)
         {
-            BasicBlock* succ = block->GetSucc(succIndex, compiler);
-            if (checkForCriticalOutEdge && succ->GetUniquePred(compiler) == nullptr)
+            BasicBlock* succBlock = block->GetSucc(succIndex, compiler);
+            if (checkForCriticalOutEdge && (succBlock->GetUniquePred(compiler) == nullptr) && !VarSetOps::IsEmpty(compiler, succBlock->bbLiveIn))
             {
-                blockInfo[block->bbNum].hasCriticalOutEdge = true;
-                hasCriticalEdges                           = true;
-                // We can stop checking now.
-                checkForCriticalOutEdge = false;
+                // This is a critical edge.
+                hasCriticalEdges = true;
+
+                LsraBlockInfo* succBlockInfo = &blockInfo[succBlock->bbNum];
+                if (thisBlockInfo->criticalOutEdgeIndex == CriticalEdgeSetInvalid)
+                {
+                    // We *may* need to create a new set.
+                    thisBlockInfo->criticalOutEdgeIndex = newIndex;
+                }
+                if (isBlockVisited(succBlock) && succBlockInfo->criticalInEdgeIndex != CriticalEdgeSetInvalid)
+                {
+                    if (succBlockInfo->criticalInEdgeIndex < thisBlockInfo->criticalOutEdgeIndex)
+                    {
+                        // We use this lower numbered set.
+                        if (thisBlockInfo->criticalOutEdgeIndex != newIndex)
+                        {
+                            // We had already found another existing set; we have a mis-match.
+                            misMatch = true;
+                        }
+                        thisBlockInfo->criticalOutEdgeIndex = succBlockInfo->criticalInEdgeIndex;
+                    }
+                    else if (succBlockInfo->criticalInEdgeIndex != thisBlockInfo->criticalOutEdgeIndex)
+                    {
+                        // We have a mismatch, but we don't want to change predBlockInfo, because we need
+                        // to merge its set with the final one we settle on.
+                        misMatch = true;
+                    }
+                }
+
+                // Either the succesor:
+                // - has not yet been visited (in which case we'll add it later), or
+                // - was a mismatch and will merge it below, or
+                // - was already in the current set.
+                assert(!isBlockVisited(succBlock) || misMatch ||
+                    (succBlockInfo->criticalInEdgeIndex == thisBlockInfo->criticalOutEdgeIndex));
             }
 
-            if (isTraversalLayoutOrder() || isBlockVisited(succ))
+            if (isTraversalLayoutOrder() || isBlockVisited(succBlock))
             {
                 continue;
             }
@@ -920,11 +1100,30 @@ void LinearScan::setBlockSequence()
             // We've now seen a predecessor, so add it to the work list and the "readySet".
             // It will be inserted in the worklist according to the specified traversal order
             // (i.e. pred-first or random, since layout order is handled above).
-            if (!BlockSetOps::IsMember(compiler, readySet, succ->bbNum))
+            if (!BlockSetOps::IsMember(compiler, readySet, succBlock->bbNum))
             {
-                addToBlockSequenceWorkList(readySet, succ, predSet);
-                BlockSetOps::AddElemD(compiler, readySet, succ->bbNum);
+                addToBlockSequenceWorkList(readySet, succBlock, predSet);
+                BlockSetOps::AddElemD(compiler, readySet, succBlock->bbNum);
             }
+        }
+
+        if (thisBlockInfo->criticalOutEdgeIndex != CriticalEdgeSetInvalid)
+        {
+            Compiler::BlockListNode* outEdgeListNode = new (compiler) Compiler::BlockListNode(block);
+            if (thisBlockInfo->criticalOutEdgeIndex == newIndex)
+            {
+                // We need to actually allocate this new set.
+                makeNewCriticalEdgeSet(newIndex, block);
+            }
+            // Add this edge to the criticalOutEdgeIndex set.
+            CriticalEdgeSet* edgeSet = getCriticalEdgeSet(thisBlockInfo->criticalOutEdgeIndex);
+            edgeSet->addToOutEdges(outEdgeListNode);
+        }
+
+        if (misMatch)
+        {
+            // Traverse all successors again, updating and merging the sets.
+            mergeCriticalOutSets(block);
         }
 
         // For layout order, simply use bbNext
@@ -984,37 +1183,8 @@ void LinearScan::setBlockSequence()
     {
         assert(isBlockVisited(block));
     }
-
-    JITDUMP("LSRA Block Sequence: ");
-    int i = 1;
-    for (BasicBlock *block = startBlockSequence(); block != nullptr; ++i, block = moveToNextBlock())
-    {
-        JITDUMP(FMT_BB, block->bbNum);
-
-        if (block->isMaxBBWeight())
-        {
-            JITDUMP("(MAX) ");
-        }
-        else
-        {
-            JITDUMP("(%6s) ", refCntWtd2str(block->getBBWeight(compiler)));
-        }
-
-        if (blockInfo[block->bbNum].hasEHBoundaryIn)
-        {
-            JITDUMP(" EH-in");
-        }
-        if (blockInfo[block->bbNum].hasEHBoundaryOut)
-        {
-            JITDUMP(" EH-out");
-        }
-        if (blockInfo[block->bbNum].hasEHPred)
-        {
-            JITDUMP(" has EH pred");
-        }
-        JITDUMP("\n");
-    }
-    JITDUMP("\n");
+    dumpBlockSequence();
+    validateAndDumpCriticalEdgeSets();
 #endif
 }
 
@@ -1184,7 +1354,6 @@ BasicBlock* LinearScan::startBlockSequence()
     BasicBlock* curBB = compiler->fgFirstBB;
     curBBSeqNum       = 0;
     curBBNum          = curBB->bbNum;
-    assert(blockSequence[0] == compiler->fgFirstBB);
     markBlockVisited(curBB);
     return curBB;
 }
@@ -2003,40 +2172,10 @@ void LinearScan::setOutVarRegForBB(unsigned int bbNum, unsigned int varNum, regN
     outVarToRegMaps[bbNum][compiler->lvaTable[varNum].lvVarIndex] = (regNumberSmall)reg;
 }
 
-LinearScan::SplitEdgeInfo LinearScan::getSplitEdgeInfo(unsigned int bbNum)
-{
-    assert(enregisterLocalVars);
-    SplitEdgeInfo splitEdgeInfo;
-    assert(bbNum <= compiler->fgBBNumMax);
-    assert(bbNum > bbNumMaxBeforeResolution);
-    assert(splitBBNumToTargetBBNumMap != nullptr);
-    splitBBNumToTargetBBNumMap->Lookup(bbNum, &splitEdgeInfo);
-    assert(splitEdgeInfo.toBBNum <= bbNumMaxBeforeResolution);
-    assert(splitEdgeInfo.fromBBNum <= bbNumMaxBeforeResolution);
-    return splitEdgeInfo;
-}
-
 VarToRegMap LinearScan::getInVarToRegMap(unsigned int bbNum)
 {
     assert(enregisterLocalVars);
     assert(bbNum <= compiler->fgBBNumMax);
-    // For the blocks inserted to split critical edges, the inVarToRegMap is
-    // equal to the outVarToRegMap at the "from" block.
-    if (bbNum > bbNumMaxBeforeResolution)
-    {
-        SplitEdgeInfo splitEdgeInfo = getSplitEdgeInfo(bbNum);
-        unsigned      fromBBNum     = splitEdgeInfo.fromBBNum;
-        if (fromBBNum == 0)
-        {
-            assert(splitEdgeInfo.toBBNum != 0);
-            return inVarToRegMaps[splitEdgeInfo.toBBNum];
-        }
-        else
-        {
-            return outVarToRegMaps[fromBBNum];
-        }
-    }
-
     return inVarToRegMaps[bbNum];
 }
 
@@ -2044,28 +2183,6 @@ VarToRegMap LinearScan::getOutVarToRegMap(unsigned int bbNum)
 {
     assert(enregisterLocalVars);
     assert(bbNum <= compiler->fgBBNumMax);
-    if (bbNum == 0)
-    {
-        return nullptr;
-    }
-    // For the blocks inserted to split critical edges, the outVarToRegMap is
-    // equal to the inVarToRegMap at the target.
-    if (bbNum > bbNumMaxBeforeResolution)
-    {
-        // If this is an empty block, its in and out maps are both the same.
-        // We identify this case by setting fromBBNum or toBBNum to 0, and using only the other.
-        SplitEdgeInfo splitEdgeInfo = getSplitEdgeInfo(bbNum);
-        unsigned      toBBNum       = splitEdgeInfo.toBBNum;
-        if (toBBNum == 0)
-        {
-            assert(splitEdgeInfo.fromBBNum != 0);
-            return outVarToRegMaps[splitEdgeInfo.fromBBNum];
-        }
-        else
-        {
-            return inVarToRegMaps[toBBNum];
-        }
-    }
     return outVarToRegMaps[bbNum];
 }
 
@@ -2103,16 +2220,6 @@ regNumber LinearScan::getVarReg(VarToRegMap bbVarToRegMap, unsigned int trackedV
     assert(enregisterLocalVars);
     assert(trackedVarIndex < compiler->lvaTrackedCount);
     return (regNumber)bbVarToRegMap[trackedVarIndex];
-}
-
-// Initialize the incoming VarToRegMap to the given map values (generally a predecessor of
-// the block)
-VarToRegMap LinearScan::setInVarToRegMap(unsigned int bbNum, VarToRegMap srcVarToRegMap)
-{
-    assert(enregisterLocalVars);
-    VarToRegMap inVarToRegMap = inVarToRegMaps[bbNum];
-    memcpy(inVarToRegMap, srcVarToRegMap, (regMapCount * sizeof(regNumber)));
-    return inVarToRegMap;
 }
 
 //------------------------------------------------------------------------
@@ -4889,7 +4996,7 @@ void LinearScan::processBlockStartLocations(BasicBlock* currentBlock)
     unsigned    predBBNum         = blockInfo[currentBlock->bbNum].predBBNum;
     VarToRegMap predVarToRegMap   = getOutVarToRegMap(predBBNum);
     VarToRegMap inVarToRegMap     = getInVarToRegMap(currentBlock->bbNum);
-    bool        hasCriticalInEdge = blockInfo[currentBlock->bbNum].hasCriticalInEdge;
+    bool        hasCriticalInEdge = (blockInfo[currentBlock->bbNum].criticalInEdgeIndex != CriticalEdgeSetInvalid);
 
     // If this block enters an exception region, all incoming vars are on the stack.
     if (predBBNum == 0)
@@ -4925,6 +5032,11 @@ void LinearScan::processBlockStartLocations(BasicBlock* currentBlock)
     // inactive registers available for the rotation.
     regMaskTP inactiveRegs = RBM_NONE;
 #endif // DEBUG
+
+    // If this has an incoming critical edge, we're going to set the preference on any live-in
+    // vars so that we're more likely to avoid resolution moves.
+    bool hasIncomingCriticalEdge = (blockInfo[currentBlock->bbNum].criticalInEdgeIndex != CriticalEdgeSetInvalid);
+
     regMaskTP       liveRegs = RBM_NONE;
     VarSetOps::Iter iter(compiler, currentLiveVars);
     unsigned        varIndex = 0;
@@ -4973,6 +5085,12 @@ void LinearScan::processBlockStartLocations(BasicBlock* currentBlock)
             }
 #endif // DEBUG
             setVarReg(inVarToRegMap, varIndex, targetReg);
+            // If this is a critical edge, set this is its only preference.
+            if ((targetReg != REG_STK) && hasIncomingCriticalEdge)
+            {
+                interval->registerPreferences = genRegMask(targetReg);
+                interval->hasCriticalPref = true;
+            }
         }
         else // allocationPassComplete (i.e. resolution/write-back pass)
         {
@@ -7575,7 +7693,6 @@ void LinearScan::resolveRegisters()
             printf("Resolution Candidates: ");
             dumpConvertedVarSet(compiler, resolutionCandidateVars);
             printf("\n");
-            printf("Has %sCritical Edges\n\n", hasCriticalEdges ? "" : "No");
 
             printf("Prior to Resolution\n");
             foreach_block(compiler, block)
@@ -7934,7 +8051,7 @@ void LinearScan::insertSwap(
 }
 
 //------------------------------------------------------------------------
-// getTempRegForResolution: Get a free register to use for resolution code.
+// getTempRegsForResolution: Get a free registers to use for resolution code.
 //
 // Arguments:
 //    fromBlock - The "from" block on the edge being resolved.
@@ -7949,38 +8066,33 @@ void LinearScan::insertSwap(
 //    available, and to handle that case appropriately.
 //    It is also up to the caller to cache the return value, as this is not cheap to compute.
 
-regNumber LinearScan::getTempRegForResolution(BasicBlock* fromBlock, BasicBlock* toBlock, var_types type)
+regMaskTP LinearScan::getTempRegsForResolution(VarToRegMap fromVarToRegMap, VarToRegMap toVarToRegMap, VARSET_VALARG_TP liveSet)
 {
-    // TODO-Throughput: This would be much more efficient if we add RegToVarMaps instead of VarToRegMaps
+    // TODO-Throughput: This would be much more efficient if we had RegToVarMaps instead of VarToRegMaps
     // and they would be more space-efficient as well.
-    VarToRegMap fromVarToRegMap = getOutVarToRegMap(fromBlock->bbNum);
-    VarToRegMap toVarToRegMap   = getInVarToRegMap(toBlock->bbNum);
-
-#ifdef TARGET_ARM
-    regMaskTP freeRegs;
-    if (type == TYP_DOUBLE)
+    regMaskTP freeRegs = RBM_NONE;
+    if (compiler->compFloatingPointUsed)
     {
-        // We have to consider all float registers for TYP_DOUBLE
-        freeRegs = allRegs(TYP_FLOAT);
+        freeRegs |= allRegs(TYP_FLOAT);
     }
+#ifdef _TARGET_XARCH_
     else
     {
-        freeRegs = allRegs(type);
+        // We don't need temp int regs on XARCH.
+        return RBM_NONE;
     }
-#else  // !TARGET_ARM
-    regMaskTP freeRegs = allRegs(type);
-#endif // !TARGET_ARM
+#endif // _TARGET_XARCH_
+    freeRegs |= allRegs(TYP_INT);
 
 #ifdef DEBUG
     if (getStressLimitRegs() == LSRA_LIMIT_SMALL_SET)
     {
-        return REG_NA;
+        return RBM_NONE;
     }
+    freeRegs = stressLimitRegs(nullptr, freeRegs);
 #endif // DEBUG
-    INDEBUG(freeRegs = stressLimitRegs(nullptr, freeRegs));
 
-    // We are only interested in the variables that are live-in to the "to" block.
-    VarSetOps::Iter iter(compiler, toBlock->bbLiveIn);
+    VarSetOps::Iter iter(compiler, liveSet);
     unsigned        varIndex = 0;
     while (iter.NextElem(&varIndex) && freeRegs != RBM_NONE)
     {
@@ -7996,24 +8108,7 @@ regNumber LinearScan::getTempRegForResolution(BasicBlock* fromBlock, BasicBlock*
             freeRegs &= ~genRegMask(toReg, getIntervalForLocalVar(varIndex)->registerType);
         }
     }
-
-#ifdef TARGET_ARM
-    if (type == TYP_DOUBLE)
-    {
-        // Exclude any doubles for which the odd half isn't in freeRegs.
-        freeRegs = freeRegs & ((freeRegs << 1) & RBM_ALLDOUBLE);
-    }
-#endif
-
-    if (freeRegs == RBM_NONE)
-    {
-        return REG_NA;
-    }
-    else
-    {
-        regNumber tempReg = genRegNumFromMask(genFindLowestBit(freeRegs));
-        return tempReg;
-    }
+    return freeRegs;
 }
 
 #ifdef TARGET_ARM
@@ -8115,16 +8210,14 @@ void LinearScan::addResolution(
     {
         // We can't add resolution to a register at the bottom of a block that has an EHBoundaryOut,
         // except in the case of the "EH Dummy" resolution from the stack.
-        assert((block->bbNum > bbNumMaxBeforeResolution) || (fromReg == REG_STK) ||
-               !blockInfo[block->bbNum].hasEHBoundaryOut);
+        assert((fromReg == REG_STK) || !blockInfo[block->bbNum].hasEHBoundaryOut);
         insertionPointString = "bottom";
     }
     else
     {
         // We can't add resolution at the top of a block that has an EHBoundaryIn,
         // except in the case of the "EH Dummy" resolution to the stack.
-        assert((block->bbNum > bbNumMaxBeforeResolution) || (toReg == REG_STK) ||
-               !blockInfo[block->bbNum].hasEHBoundaryIn);
+        assert((toReg == REG_STK) || !blockInfo[block->bbNum].hasEHBoundaryIn);
         insertionPointString = "top";
     }
 #endif // DEBUG
@@ -8143,292 +8236,350 @@ void LinearScan::addResolution(
         assert((interval->isSpilled) || (interval->isSplit));
     }
 
+    assert(VarSetOps::IsMember(compiler, resolutionCandidateVars, interval->getVarIndex(compiler)));
     INTRACK_STATS(updateLsraStat(LSRA_STAT_RESOLUTION_MOV, block->bbNum));
 }
 
 //------------------------------------------------------------------------
-// handleOutgoingCriticalEdges: Performs the necessary resolution on all critical edges that feed out of 'block'
+// handleCriticalEdgeSet: Performs the necessary resolution on all critical edges in a set
 //
 // Arguments:
-//    block     - the block with outgoing critical edges.
+//    criticalEdgeSet - the set of edges to resolve.
 //
 // Return Value:
 //    None..
 //
 // Notes:
-//    For all outgoing critical edges (i.e. any successor of this block which is
-//    a join edge), if there are any conflicts, split the edge by adding a new block,
-//    and generate the resolution code into that block.
+//    
 
-void LinearScan::handleOutgoingCriticalEdges(BasicBlock* block)
+void LinearScan::handleCriticalEdgeSet(CriticalEdgeSet* criticalEdgeSet)
 {
-    VARSET_TP outResolutionSet(VarSetOps::Intersection(compiler, block->bbLiveOut, resolutionCandidateVars));
-    if (VarSetOps::IsEmpty(compiler, outResolutionSet))
+    validateAndDumpCriticalEdgeSet(criticalEdgeSet);
+
+    unsigned masterBBNum = criticalEdgeSet->masterBlock->bbNum;
+    // Note that the masterBlock may have edges both into and out of the CriticalEdgeSet.
+    // If it has both, we'll use the "in" set , as the backedge target is most likely to be
+    // the "in" edge of the highest weight block in its set.
+    //
+    VarToRegMap masterVarToRegMap = nullptr;
+    VARSET_TP   masterLiveSet;
+    bool masterIsInSet = true;
+    if (blockInfo[masterBBNum].criticalInEdgeIndex == criticalEdgeSet->index)
+    {
+        masterVarToRegMap = inVarToRegMaps[masterBBNum];
+        masterLiveSet = criticalEdgeSet->masterBlock->bbLiveIn;
+    }
+    else
+    {
+        assert(blockInfo[masterBBNum].criticalOutEdgeIndex == criticalEdgeSet->index);
+        masterVarToRegMap = outVarToRegMaps[masterBBNum];
+        masterLiveSet = criticalEdgeSet->masterBlock->bbLiveOut;
+        masterIsInSet = false;
+    }
+
+    // We do a first pass over all the edges to determine the variables that require no resolution
+    // (i.e. are in the same location on every edge where they are live).
+    // Others go into the diffResolutionSet.
+    // We also collect information on any registers that are used in a branch on an out-edge.
+
+    VARSET_TP liveVars(VarSetOps::MakeCopy(compiler, masterLiveSet));
+    VARSET_TP diffResolutionSet(VarSetOps::MakeEmpty(compiler));
+    VARSET_TP sameResolutionSet(VarSetOps::MakeCopy(compiler, masterLiveSet));
+    copyVarToRegMap(sharedCriticalVarToRegMap, masterVarToRegMap);
+    regMaskTP branchRegs = RBM_NONE;
+    BasicBlock *curBlock;
+    for (Compiler::BlockListNode* listNode = criticalEdgeSet->OutEdgeBBList; listNode != nullptr; listNode = listNode->m_next)
+    {
+        curBlock = listNode->m_blk;
+        // If any of the blocks ends in a switch, we need to reserve the registers it uses.
+        if (curBlock->bbJumpKind == BBJ_SWITCH)
+        {
+            // At this point, Lowering has transformed any non-switch-table blocks into
+            // cascading ifs.
+            GenTree* switchTable = LIR::AsRange(curBlock).LastNode();
+            assert(switchTable != nullptr && switchTable->OperGet() == GT_SWITCH_TABLE);
+
+            branchRegs = switchTable->gtRsvdRegs;
+            GenTree* op1 = switchTable->gtGetOp1();
+            GenTree* op2 = switchTable->gtGetOp2();
+            noway_assert(op1 != nullptr && op2 != nullptr);
+            assert(op1->GetRegNum() != REG_NA && op2->GetRegNum() != REG_NA);
+            // No floating point values, so no need to worry about the register type
+            // (i.e. for ARM32, where we used the genRegMask overload with a type).
+            assert(varTypeIsIntegralOrI(op1) && varTypeIsIntegralOrI(op2));
+            branchRegs |= genRegMask(op1->GetRegNum());
+            branchRegs |= genRegMask(op2->GetRegNum());
+        }
+#ifdef _TARGET_ARM64_
+        // Next, if this blocks ends with a JCMP, we have to make sure not to copy
+        // into the register that it uses or modify the local variable it must consume
+        LclVarDsc* jcmpLocalVarDsc = nullptr;
+        if (curBlock->bbJumpKind == BBJ_COND)
+        {
+            GenTree* lastNode = LIR::AsRange(curBlock).LastNode();
+
+            if (lastNode->OperIs(GT_JCMP))
+            {
+                GenTree* op1 = lastNode->gtGetOp1();
+                branchRegs |= genRegMask(op1->GetRegNum());
+
+                if (op1->IsLocal())
+                {
+                    GenTreeLclVarCommon* lcl = op1->AsLclVarCommon();
+                    jcmpLocalVarDsc = &compiler->lvaTable[lcl->GetLclNum()];
+                }
+            }
+        }
+#endif
+        VarToRegMap outVarToRegMap = getOutVarToRegMap(curBlock->bbNum);
+        VarSetOps::Iter liveOutIter(compiler, curBlock->bbLiveOut);
+        unsigned        liveOutVarIndex = 0;
+        while (liveOutIter.NextElem(&liveOutVarIndex))
+        {
+            regNumber fromReg = getVarReg(outVarToRegMap, liveOutVarIndex);
+            if (VarSetOps::IsMember(compiler, liveVars, liveOutVarIndex))
+            {
+                if (fromReg != sharedCriticalVarToRegMap[liveOutVarIndex])
+                {
+                    // This requires resolution for this block.
+                    VarSetOps::AddElemD(compiler, diffResolutionSet, liveOutVarIndex);
+                    VarSetOps::RemoveElemD(compiler, sameResolutionSet, liveOutVarIndex);
+                }
+            }
+            else
+            {
+                // This lclVar hasn't yet been encountered.
+                VarSetOps::AddElemD(compiler, liveVars, liveOutVarIndex);
+                VarSetOps::AddElemD(compiler, sameResolutionSet, liveOutVarIndex);
+                sharedCriticalVarToRegMap[liveOutVarIndex] = (regNumberSmall)fromReg;
+            }
+        }
+    }
+    // Now do the same for the in-edges (though we don't need to worry about branchRegs here).
+    for (Compiler::BlockListNode* listNode = criticalEdgeSet->InEdgeBBList; listNode != nullptr; listNode = listNode->m_next)
+    {
+        curBlock = listNode->m_blk;
+        VarToRegMap inVarToRegMap = getInVarToRegMap(curBlock->bbNum);
+        VarSetOps::Iter liveInIter(compiler, curBlock->bbLiveIn);
+        unsigned        liveInVarIndex = 0;
+        while (liveInIter.NextElem(&liveInVarIndex))
+        {
+            regNumber reg = getVarReg(inVarToRegMap, liveInVarIndex);
+            if (VarSetOps::IsMember(compiler, liveVars, liveInVarIndex))
+            {
+                if (reg != sharedCriticalVarToRegMap[liveInVarIndex])
+                {
+                    // This is a lclVar that we've seen, but it's in a different location.
+                    VarSetOps::AddElemD(compiler, diffResolutionSet, liveInVarIndex);
+                    VarSetOps::RemoveElemD(compiler, sameResolutionSet, liveInVarIndex);
+                }
+            }
+            else
+            {
+                // This lclVar hasn't yet been encountered.
+                // Record it's location; even if it's in another location on another edge, we will
+                // assign it this location for resolution.
+                VarSetOps::AddElemD(compiler, liveVars, liveInVarIndex);
+                VarSetOps::AddElemD(compiler, sameResolutionSet, liveInVarIndex);
+                sharedCriticalVarToRegMap[liveInVarIndex] = (regNumberSmall)reg;
+            }
+        }
+    }
+
+    // At this point, the diffResolutionSet should only contain variables that are
+    // in resolutionCandidateVars.
+    assert(VarSetOps::IsEmpty(compiler, VarSetOps::Diff(compiler, diffResolutionSet, resolutionCandidateVars)));
+
+    // If there's nothing to resolve, we're done.
+    if (VarSetOps::IsEmpty(compiler, diffResolutionSet))
     {
         return;
     }
-    VARSET_TP sameResolutionSet(VarSetOps::MakeEmpty(compiler));
-    VARSET_TP sameLivePathsSet(VarSetOps::MakeEmpty(compiler));
-    VARSET_TP singleTargetSet(VarSetOps::MakeEmpty(compiler));
-    VARSET_TP diffResolutionSet(VarSetOps::MakeEmpty(compiler));
 
-    // Get the outVarToRegMap for this block
-    VarToRegMap outVarToRegMap = getOutVarToRegMap(block->bbNum);
-    unsigned    succCount      = block->NumSucc(compiler);
-    assert(succCount > 1);
-    VarToRegMap firstSuccInVarToRegMap = nullptr;
-    BasicBlock* firstSucc              = nullptr;
-
-    // First, determine the live regs at the end of this block so that we know what regs are
-    // available to copy into.
-    // Note that for this purpose we use the full live-out set, because we must ensure that
-    // even the registers that remain the same across the edge are preserved correctly.
-    regMaskTP       liveOutRegs = RBM_NONE;
-    VarSetOps::Iter liveOutIter(compiler, block->bbLiveOut);
-    unsigned        liveOutVarIndex = 0;
-    while (liveOutIter.NextElem(&liveOutVarIndex))
+    // This is the set of registers that are already allocated for this critical edge set.
+    // We start with branchRegs and add any registers in the sharedCriticalVarToRegMap.
+    // Note that we don't worry about those overlapping with branchRegs. If they do, they
+    // must be used only on an out-edge that doesn't include the branch. Similarly, we may
+    // have multiple lclVars that occupy the same register, but we've determined above that
+    // they don't conflict.
+    regMaskTP       liveOutRegs = branchRegs;
+    VarSetOps::Iter sharedResolutionIter(compiler, sameResolutionSet);
+    unsigned sharedLiveIndex = 0;
+    while (sharedResolutionIter.NextElem(&sharedLiveIndex))
     {
-        regNumber fromReg = getVarReg(outVarToRegMap, liveOutVarIndex);
-        if (fromReg != REG_STK)
+        regNumber reg = getVarReg(sharedCriticalVarToRegMap, sharedLiveIndex);
+        if (reg != REG_STK)
         {
-            regMaskTP fromRegMask = genRegMask(fromReg, getIntervalForLocalVar(liveOutVarIndex)->registerType);
-            liveOutRegs |= fromRegMask;
-        }
+            assert(genIsValidReg(reg));
+            liveOutRegs |= genRegMask(reg);
     }
+}
 
-    // Next, if this blocks ends with a switch table, we have to make sure not to copy
-    // into the registers that it uses.
-    regMaskTP switchRegs = RBM_NONE;
-    if (block->bbJumpKind == BBJ_SWITCH)
+#ifdef DEBUG
+    if (VERBOSE)
     {
-        // At this point, Lowering has transformed any non-switch-table blocks into
-        // cascading ifs.
-        GenTree* switchTable = LIR::AsRange(block).LastNode();
-        assert(switchTable != nullptr && switchTable->OperGet() == GT_SWITCH_TABLE);
-
-        switchRegs   = switchTable->gtRsvdRegs;
-        GenTree* op1 = switchTable->gtGetOp1();
-        GenTree* op2 = switchTable->gtGetOp2();
-        noway_assert(op1 != nullptr && op2 != nullptr);
-        assert(op1->GetRegNum() != REG_NA && op2->GetRegNum() != REG_NA);
-        // No floating point values, so no need to worry about the register type
-        // (i.e. for ARM32, where we used the genRegMask overload with a type).
-        assert(varTypeIsIntegralOrI(op1) && varTypeIsIntegralOrI(op2));
-        switchRegs |= genRegMask(op1->GetRegNum());
-        switchRegs |= genRegMask(op2->GetRegNum());
-    }
-
-#ifdef TARGET_ARM64
-    // Next, if this blocks ends with a JCMP, we have to make sure not to copy
-    // into the register that it uses or modify the local variable it must consume
-    LclVarDsc* jcmpLocalVarDsc = nullptr;
-    if (block->bbJumpKind == BBJ_COND)
-    {
-        GenTree* lastNode = LIR::AsRange(block).LastNode();
-
-        if (lastNode->OperIs(GT_JCMP))
-        {
-            GenTree* op1 = lastNode->gtGetOp1();
-            switchRegs |= genRegMask(op1->GetRegNum());
-
-            if (op1->IsLocal())
-            {
-                GenTreeLclVarCommon* lcl = op1->AsLclVarCommon();
-                jcmpLocalVarDsc          = &compiler->lvaTable[lcl->GetLclNum()];
-            }
-        }
+        JITDUMP("After first pass:\n  sameResolutionSet: ");
+        dumpConvertedVarSet(compiler, sameResolutionSet);
+        JITDUMP("\n  diffResolutionSet: ");
+        dumpConvertedVarSet(compiler, diffResolutionSet);
+        JITDUMP("\n  sharedCriticalVarToRegMap: ");
+        dumpVarToRegMap(sharedCriticalVarToRegMap);
     }
 #endif
-
-    VarToRegMap sameVarToRegMap = sharedCriticalVarToRegMap;
-    regMaskTP   sameWriteRegs   = RBM_NONE;
-    regMaskTP   diffReadRegs    = RBM_NONE;
-
-    // For each var that may require resolution, classify them as:
-    // - in the same register at the end of this block and at each target (no resolution needed)
-    // - in different registers at different targets (resolve separately):
-    //     diffResolutionSet
-    // - in the same register at each target at which it's live, but different from the end of
-    //   this block.  We may be able to resolve these as if it is "join", but only if they do not
-    //   write to any registers that are read by those in the diffResolutionSet:
-    //     sameResolutionSet
-
-    VarSetOps::Iter outResolutionSetIter(compiler, outResolutionSet);
-    unsigned        outResolutionSetVarIndex = 0;
-    while (outResolutionSetIter.NextElem(&outResolutionSetVarIndex))
+    short edgeRegCount[REG_COUNT];
+    regMaskTP      edgeRegs;
+    VarSetOps::Iter diffVarIter(compiler, diffResolutionSet);
+    unsigned diffVarIndex = 0;
+    while (diffVarIter.NextElem(&diffVarIndex))
     {
-        regNumber fromReg             = getVarReg(outVarToRegMap, outResolutionSetVarIndex);
-        bool      isMatch             = true;
-        bool      isSame              = false;
-        bool      maybeSingleTarget   = false;
-        bool      maybeSameLivePaths  = false;
-        bool      liveOnlyAtSplitEdge = true;
-        regNumber sameToReg           = REG_NA;
-        for (unsigned succIndex = 0; succIndex < succCount; succIndex++)
+        // The candidate registers for this lclVar.
+        edgeRegs = RBM_NONE;
+        // We'll initialize the actual regs' count when we add them to 'edgeRegs'.
+        edgeRegCount[REG_STK] = 0;
+
+        // Iterate over all of the edges to find the most frequent location, which may be REG_STK.
+        for (Compiler::BlockListNode* listNode = criticalEdgeSet->OutEdgeBBList; listNode != nullptr; listNode = listNode->m_next)
         {
-            BasicBlock* succBlock = block->GetSucc(succIndex, compiler);
-            if (!VarSetOps::IsMember(compiler, succBlock->bbLiveIn, outResolutionSetVarIndex))
+            curBlock = listNode->m_blk;
+            VarToRegMap outVarToRegMap = getOutVarToRegMap(curBlock->bbNum);
+            regNumber reg = getVarReg(outVarToRegMap, diffVarIndex);
+            if (VarSetOps::IsMember(compiler, curBlock->bbLiveOut, diffVarIndex) && genIsValidReg(reg) && ((reg == REG_STK) || ((liveOutRegs & genRegMask(reg)) == RBM_NONE)))
             {
-                maybeSameLivePaths = true;
-                continue;
-            }
-            else if (liveOnlyAtSplitEdge)
-            {
-                // Is the var live only at those target blocks which are connected by a split edge to this block
-                liveOnlyAtSplitEdge = ((succBlock->bbPreds->flNext == nullptr) && (succBlock != compiler->fgFirstBB));
-            }
-
-            regNumber toReg = getVarReg(getInVarToRegMap(succBlock->bbNum), outResolutionSetVarIndex);
-            if (sameToReg == REG_NA)
-            {
-                sameToReg = toReg;
-                continue;
-            }
-            if (toReg == sameToReg)
-            {
-                continue;
-            }
-            sameToReg = REG_NA;
-            break;
-        }
-
-        // Check for the cases where we can't write to a register.
-        // We only need to check for these cases if sameToReg is an actual register (not REG_STK).
-        if (sameToReg != REG_NA && sameToReg != REG_STK)
-        {
-            // If there's a path on which this var isn't live, it may use the original value in sameToReg.
-            // In this case, sameToReg will be in the liveOutRegs of this block.
-            // Similarly, if sameToReg is in sameWriteRegs, it has already been used (i.e. for a lclVar that's
-            // live only at another target), and we can't copy another lclVar into that reg in this block.
-            regMaskTP sameToRegMask =
-                genRegMask(sameToReg, getIntervalForLocalVar(outResolutionSetVarIndex)->registerType);
-            if (maybeSameLivePaths &&
-                (((sameToRegMask & liveOutRegs) != RBM_NONE) || ((sameToRegMask & sameWriteRegs) != RBM_NONE)))
-            {
-                sameToReg = REG_NA;
-            }
-            // If this register is used by a switch table at the end of the block, we can't do the copy
-            // in this block (since we can't insert it after the switch).
-            if ((sameToRegMask & switchRegs) != RBM_NONE)
-            {
-                sameToReg = REG_NA;
-            }
-
-#ifdef TARGET_ARM64
-            if (jcmpLocalVarDsc && (jcmpLocalVarDsc->lvVarIndex == outResolutionSetVarIndex))
-            {
-                sameToReg = REG_NA;
-            }
-#endif
-
-            // If the var is live only at those blocks connected by a split edge and not live-in at some of the
-            // target blocks, we will resolve it the same way as if it were in diffResolutionSet and resolution
-            // will be deferred to the handling of split edges, which means copy will only be at those target(s).
-            //
-            // Another way to achieve similar resolution for vars live only at split edges is by removing them
-            // from consideration up-front but it requires that we traverse those edges anyway to account for
-            // the registers that must note be overwritten.
-            if (liveOnlyAtSplitEdge && maybeSameLivePaths)
-            {
-                sameToReg = REG_NA;
-            }
-        }
-
-        if (sameToReg == REG_NA)
-        {
-            VarSetOps::AddElemD(compiler, diffResolutionSet, outResolutionSetVarIndex);
-            if (fromReg != REG_STK)
-            {
-                diffReadRegs |= genRegMask(fromReg, getIntervalForLocalVar(outResolutionSetVarIndex)->registerType);
-            }
-        }
-        else if (sameToReg != fromReg)
-        {
-            VarSetOps::AddElemD(compiler, sameResolutionSet, outResolutionSetVarIndex);
-            setVarReg(sameVarToRegMap, outResolutionSetVarIndex, sameToReg);
-            if (sameToReg != REG_STK)
-            {
-                sameWriteRegs |= genRegMask(sameToReg, getIntervalForLocalVar(outResolutionSetVarIndex)->registerType);
-            }
-        }
-    }
-
-    if (!VarSetOps::IsEmpty(compiler, sameResolutionSet))
-    {
-        if ((sameWriteRegs & diffReadRegs) != RBM_NONE)
-        {
-            // We cannot split the "same" and "diff" regs if the "same" set writes registers
-            // that must be read by the "diff" set.  (Note that when these are done as a "batch"
-            // we carefully order them to ensure all the input regs are read before they are
-            // overwritten.)
-            VarSetOps::UnionD(compiler, diffResolutionSet, sameResolutionSet);
-            VarSetOps::ClearD(compiler, sameResolutionSet);
-        }
-        else
-        {
-            // For any vars in the sameResolutionSet, we can simply add the move at the end of "block".
-            resolveEdge(block, nullptr, ResolveSharedCritical, sameResolutionSet);
-        }
-    }
-    if (!VarSetOps::IsEmpty(compiler, diffResolutionSet))
-    {
-        for (unsigned succIndex = 0; succIndex < succCount; succIndex++)
-        {
-            BasicBlock* succBlock = block->GetSucc(succIndex, compiler);
-
-            // Any "diffResolutionSet" resolution for a block with no other predecessors will be handled later
-            // as split resolution.
-            if ((succBlock->bbPreds->flNext == nullptr) && (succBlock != compiler->fgFirstBB))
-            {
-                continue;
-            }
-
-            // Now collect the resolution set for just this edge, if any.
-            // Check only the vars in diffResolutionSet that are live-in to this successor.
-            bool        needsResolution   = false;
-            VarToRegMap succInVarToRegMap = getInVarToRegMap(succBlock->bbNum);
-            VARSET_TP   edgeResolutionSet(VarSetOps::Intersection(compiler, diffResolutionSet, succBlock->bbLiveIn));
-            VarSetOps::Iter iter(compiler, edgeResolutionSet);
-            unsigned        varIndex = 0;
-            while (iter.NextElem(&varIndex))
-            {
-                regNumber fromReg = getVarReg(outVarToRegMap, varIndex);
-                regNumber toReg   = getVarReg(succInVarToRegMap, varIndex);
-
-                if (fromReg == toReg)
+                if (reg == REG_STK)
                 {
-                    VarSetOps::RemoveElemD(compiler, edgeResolutionSet, varIndex);
+                    edgeRegCount[REG_STK]++;
                 }
-            }
-            if (!VarSetOps::IsEmpty(compiler, edgeResolutionSet))
-            {
-                // For EH vars, we can always safely load them from the stack into the target for this block,
-                // so if we have only EH vars, we'll do that instead of splitting the edge.
-                if ((compiler->compHndBBtabCount > 0) && VarSetOps::IsSubset(compiler, edgeResolutionSet, exceptVars))
+                else if ((edgeRegs & genRegMask(reg)) == RBM_NONE)
                 {
-                    GenTree*        insertionPoint = LIR::AsRange(succBlock).FirstNonPhiNode();
-                    VarSetOps::Iter edgeSetIter(compiler, edgeResolutionSet);
-                    unsigned        edgeVarIndex = 0;
-                    while (edgeSetIter.NextElem(&edgeVarIndex))
-                    {
-                        regNumber toReg = getVarReg(succInVarToRegMap, edgeVarIndex);
-                        setVarReg(succInVarToRegMap, edgeVarIndex, REG_STK);
-                        if (toReg != REG_STK)
-                        {
-                            Interval* interval = getIntervalForLocalVar(edgeVarIndex);
-                            assert(interval->isWriteThru);
-                            addResolution(succBlock, insertionPoint, interval, toReg, REG_STK);
-                            JITDUMP(" (EHvar)\n");
-                        }
-                    }
+                    edgeRegs |= genRegMask(reg);
+                    edgeRegCount[reg] = 1;
                 }
                 else
                 {
-                    resolveEdge(block, succBlock, ResolveCritical, edgeResolutionSet);
+                    edgeRegCount[reg]++;
                 }
             }
         }
+        for (Compiler::BlockListNode* listNode = criticalEdgeSet->InEdgeBBList; listNode != nullptr; listNode = listNode->m_next)
+        {
+            curBlock = listNode->m_blk;
+            VarToRegMap inVarToRegMap = getInVarToRegMap(curBlock->bbNum);
+            regNumber reg = getVarReg(inVarToRegMap, diffVarIndex);
+            if (VarSetOps::IsMember(compiler, curBlock->bbLiveIn, diffVarIndex) && genIsValidReg(reg) && ((reg == REG_STK) || ((liveOutRegs & genRegMask(reg)) == RBM_NONE)))
+            {
+                if (reg == REG_STK)
+                {
+                    edgeRegCount[REG_STK]++;
+                }
+                else if ((edgeRegs & genRegMask(reg)) == RBM_NONE)
+                {
+                    edgeRegs |= genRegMask(reg);
+                    edgeRegCount[reg] = 1;
+                }
+                else
+                {
+                    edgeRegCount[reg]++;
+                }
+            }
+        }
+        regNumber reg = REG_NA;
+        short regCount = 0;
+        while (edgeRegs != RBM_NONE)
+        {
+            regMaskTP nextRegMask = genFindLowestBit(edgeRegs);
+            regNumber nextReg = genRegNumFromMask(nextRegMask);
+            edgeRegs &= ~nextRegMask;
+            if (edgeRegCount[nextReg] > regCount)
+            {
+                reg = nextReg;
+                regCount = edgeRegCount[nextReg];
+            }
+        }
+
+        if (reg == REG_NA)
+        {
+            reg = REG_STK;
+            setIntervalAsSpilled(getIntervalForLocalVar(diffVarIndex));
+        }
+        setVarReg(sharedCriticalVarToRegMap, diffVarIndex, reg);
+        if (reg != REG_STK)
+        {
+            liveOutRegs |= genRegMask(reg);
+        }
     }
+
+    // Iterate over all of the blocks with out-edges into this critical set, and resolve
+    // any live-out vars in the diffResolutionSet.
+    for (Compiler::BlockListNode* listNode = criticalEdgeSet->OutEdgeBBList; listNode != nullptr; listNode = listNode->m_next)
+    {
+        curBlock = listNode->m_blk;
+        VARSET_TP   curResolutionSet(VarSetOps::MakeEmpty(compiler));
+        VarToRegMap outVarToRegMap = getOutVarToRegMap(curBlock->bbNum);
+
+        VarSetOps::Iter liveOutIter(compiler, curBlock->bbLiveOut);
+        unsigned        liveOutVarIndex = 0;
+        while (liveOutIter.NextElem(&liveOutVarIndex))
+        {
+            regNumber reg = getVarReg(outVarToRegMap, liveOutVarIndex);
+            regNumber sharedReg = getVarReg(sharedCriticalVarToRegMap, liveOutVarIndex);
+            if (VarSetOps::IsMember(compiler, diffResolutionSet, liveOutVarIndex))
+            {
+                if (reg != sharedReg)
+                {
+                    // This requires resolution for this block.
+                    VarSetOps::AddElemD(compiler, curResolutionSet, liveOutVarIndex);
+                }
+            }
+            else
+            {
+                assert(reg == sharedReg);
+            }
+        }
+        if (!VarSetOps::IsEmpty(compiler, curResolutionSet))
+        {
+            resolveEdge(curBlock, nullptr, ResolveSharedCritical, curResolutionSet);
+        }
+    }
+    // Now, iterate over all of the blocks with in-edges from this critical set,
+    // and perform any necessary resolution.
+    for (Compiler::BlockListNode* listNode = criticalEdgeSet->InEdgeBBList; listNode != nullptr; listNode = listNode->m_next)
+    {
+        curBlock = listNode->m_blk;
+        VARSET_TP   curResolutionSet(VarSetOps::MakeEmpty(compiler));
+        VarToRegMap     inVarToRegMap = inVarToRegMaps[curBlock->bbNum];
+
+        VarSetOps::Iter liveInIter(compiler, curBlock->bbLiveIn);
+        unsigned        liveInVarIndex = 0;
+        while (liveInIter.NextElem(&liveInVarIndex))
+        {
+            regNumber reg = getVarReg(inVarToRegMap, liveInVarIndex);
+            regNumber sharedReg = getVarReg(sharedCriticalVarToRegMap, liveInVarIndex);
+            if (VarSetOps::IsMember(compiler, diffResolutionSet, liveInVarIndex))
+            {
+                if (reg != sharedReg)
+                {
+                    // This requires resolution for this block.
+                    VarSetOps::AddElemD(compiler, curResolutionSet, liveInVarIndex);
+                }
+            }
+            else
+            {
+                assert(reg == sharedReg);
+            }
+        }
+        if (!VarSetOps::IsEmpty(compiler, curResolutionSet))
+        {
+            resolveEdge(nullptr, curBlock, ResolveSharedCritical, curResolutionSet);
+        }
+    }
+    JITDUMP("\n");
+}
+
+int __cdecl compareBlockWeights(const void* pBB1, const void* pBB2)
+{
+    BasicBlock* bb1 = *(BasicBlock**)pBB1;
+    BasicBlock* bb2 = *(BasicBlock**)pBB2;
+    return bb2->bbWeight - bb1->bbWeight;
 }
 
 //------------------------------------------------------------------------
@@ -8464,144 +8615,79 @@ void LinearScan::resolveEdges()
         return;
     }
 
+#if 0
+    // We are going to resolve the block edges by iterating over the blocks in decreasing
+    // order of block weight.
+    qsort(blockSequence, bbSeqCount, sizeof(BasicBlock*), compareBlockWeights);
+    JITDUMP("Weight-sorted block sequence for resolution:\n");
+    dumpBlockSequence();
+#endif
+    // First, handle all the criticalEdgeSets.
+    for (CriticalEdgeSetIndex index = 0; index < criticalEdgeSetCount; index++)
+    {
+        CriticalEdgeSet* criticalEdgeSet = getCriticalEdgeSet(index);
+        if (criticalEdgeSet->isValid)
+        {
+            handleCriticalEdgeSet(criticalEdgeSet);
+        }
+    }
+    criticalEdgeResolutionComplete = true;
+
     BasicBlock *block, *prevBlock = nullptr;
-
-    // Handle all the critical edges first.
-    // We will try to avoid resolution across critical edges in cases where all the critical-edge
-    // targets of a block have the same home.  We will then split the edges only for the
-    // remaining mismatches.  We visit the out-edges, as that allows us to share the moves that are
-    // common among all the targets.
-
-    if (hasCriticalEdges)
+    for (unsigned int curBBSeqNum = 0; curBBSeqNum < bbSeqCount; curBBSeqNum++)
     {
-        foreach_block(compiler, block)
-        {
-            if (block->bbNum > bbNumMaxBeforeResolution)
-            {
-                // This is a new block added during resolution - we don't need to visit these now.
-                continue;
-            }
-            if (blockInfo[block->bbNum].hasCriticalOutEdge)
-            {
-                handleOutgoingCriticalEdges(block);
-            }
-            prevBlock = block;
-        }
-    }
+        BasicBlock* block = blockSequence[curBBSeqNum];
+        JITDUMP("\nResolving BB%02u, weight %d\n", block->bbNum, block->bbWeight);
 
-    prevBlock = nullptr;
-    foreach_block(compiler, block)
-    {
-        if (block->bbNum > bbNumMaxBeforeResolution)
+        // Critical edges were handled above.
+        if (blockInfo[block->bbNum].criticalInEdgeIndex == CriticalEdgeSetInvalid)
         {
-            // This is a new block added during resolution - we don't need to visit these now.
-            continue;
-        }
+            flowList*   preds = block->bbPreds;
+            BasicBlock* uniquePredBlock = block->GetUniquePred(compiler);
 
-        unsigned    succCount       = block->NumSucc(compiler);
-        flowList*   preds           = block->bbPreds;
-        BasicBlock* uniquePredBlock = block->GetUniquePred(compiler);
-
-        // First, if this block has a single predecessor,
-        // we may need resolution at the beginning of this block.
-        // This may be true even if it's the block we used for starting locations,
-        // if a variable was spilled.
-        VARSET_TP inResolutionSet(VarSetOps::Intersection(compiler, block->bbLiveIn, resolutionCandidateVars));
-        if (!VarSetOps::IsEmpty(compiler, inResolutionSet))
-        {
-            if (uniquePredBlock != nullptr)
+            // First, if this block has a single predecessor,
+            // we may need resolution at the beginning of this block.
+            // This may be true even if it's the block we used for starting locations,
+            // if a variable was spilled.
+            VARSET_TP inResolutionSet(VarSetOps::Intersection(compiler, block->bbLiveIn, resolutionCandidateVars));
+            if (!VarSetOps::IsEmpty(compiler, inResolutionSet))
             {
-                // We may have split edges during critical edge resolution, and in the process split
-                // a non-critical edge as well.
-                // It is unlikely that we would ever have more than one of these in sequence (indeed,
-                // I don't think it's possible), but there's no need to assume that it can't.
-                while (uniquePredBlock->bbNum > bbNumMaxBeforeResolution)
+                if (uniquePredBlock != nullptr)
                 {
-                    uniquePredBlock = uniquePredBlock->GetUniquePred(compiler);
-                    noway_assert(uniquePredBlock != nullptr);
-                }
-                resolveEdge(uniquePredBlock, block, ResolveSplit, inResolutionSet);
-            }
-        }
 
-        // Finally, if this block has a single successor:
-        //  - and that has at least one other predecessor (otherwise we will do the resolution at the
-        //    top of the successor),
-        //  - and that is not the target of a critical edge (otherwise we've already handled it)
-        // we may need resolution at the end of this block.
-
-        if (succCount == 1)
-        {
-            BasicBlock* succBlock = block->GetSucc(0, compiler);
-            if (succBlock->GetUniquePred(compiler) == nullptr)
-            {
-                VARSET_TP outResolutionSet(
-                    VarSetOps::Intersection(compiler, succBlock->bbLiveIn, resolutionCandidateVars));
-                if (!VarSetOps::IsEmpty(compiler, outResolutionSet))
-                {
-                    resolveEdge(block, succBlock, ResolveJoin, outResolutionSet);
+                    resolveEdge(uniquePredBlock, block, ResolveSplit, inResolutionSet);
                 }
             }
         }
-    }
 
-    // Now, fixup the mapping for any blocks that were adding for edge splitting.
-    // See the comment prior to the call to fgSplitEdge() in resolveEdge().
-    // Note that we could fold this loop in with the checking code below, but that
-    // would only improve the debug case, and would clutter up the code somewhat.
-    if (compiler->fgBBNumMax > bbNumMaxBeforeResolution)
-    {
-        foreach_block(compiler, block)
+        // Critical edges were handled above.
+        if (blockInfo[block->bbNum].criticalOutEdgeIndex == CriticalEdgeSetInvalid)
         {
-            if (block->bbNum > bbNumMaxBeforeResolution)
+            // If this block has a single successor:
+            //  - and that has at least one other predecessor (otherwise we will do the resolution at the
+            //    top of the successor),
+            //  - and that is not the target of a critical edge (otherwise we've already handled it)
+            // we may need resolution at the end of this block.
+
+            unsigned    succCount = block->NumSucc(compiler);
+            if (succCount == 1)
             {
-                // There may be multiple blocks inserted when we split.  But we must always have exactly
-                // one path (i.e. all blocks must be single-successor and single-predecessor),
-                // and only one block along the path may be non-empty.
-                // Note that we may have a newly-inserted block that is empty, but which connects
-                // two non-resolution blocks. This happens when an edge is split that requires it.
-
-                BasicBlock* succBlock = block;
-                do
+                BasicBlock* succBlock = block->GetSucc(0, compiler);
+                if (succBlock->GetUniquePred(compiler) == nullptr)
                 {
-                    succBlock = succBlock->GetUniqueSucc();
-                    noway_assert(succBlock != nullptr);
-                } while ((succBlock->bbNum > bbNumMaxBeforeResolution) && succBlock->isEmpty());
-
-                BasicBlock* predBlock = block;
-                do
-                {
-                    predBlock = predBlock->GetUniquePred(compiler);
-                    noway_assert(predBlock != nullptr);
-                } while ((predBlock->bbNum > bbNumMaxBeforeResolution) && predBlock->isEmpty());
-
-                unsigned succBBNum = succBlock->bbNum;
-                unsigned predBBNum = predBlock->bbNum;
-                if (block->isEmpty())
-                {
-                    // For the case of the empty block, find the non-resolution block (succ or pred).
-                    if (predBBNum > bbNumMaxBeforeResolution)
+                    VARSET_TP outResolutionSet(
+                        VarSetOps::Intersection(compiler, succBlock->bbLiveIn, resolutionCandidateVars));
+                    if (!VarSetOps::IsEmpty(compiler, outResolutionSet))
                     {
-                        assert(succBBNum <= bbNumMaxBeforeResolution);
-                        predBBNum = 0;
-                    }
-                    else
-                    {
-                        succBBNum = 0;
+                        resolveEdge(block, succBlock, ResolveJoin, outResolutionSet);
                     }
                 }
-                else
-                {
-                    assert((succBBNum <= bbNumMaxBeforeResolution) && (predBBNum <= bbNumMaxBeforeResolution));
-                }
-                SplitEdgeInfo info = {predBBNum, succBBNum};
-                getSplitBBNumToTargetBBNumMap()->Set(block->bbNum, info);
-
-                // Set both the live-in and live-out to the live-in of the successor (by construction liveness
-                // doesn't change in a split block).
-                VarSetOps::Assign(compiler, block->bbLiveIn, succBlock->bbLiveIn);
-                VarSetOps::Assign(compiler, block->bbLiveOut, succBlock->bbLiveIn);
             }
+        }
+        if (VERBOSE)
+        {
+            dumpInVarToRegMap(block);
+            dumpOutVarToRegMap(block);
         }
     }
 
@@ -8610,10 +8696,6 @@ void LinearScan::resolveEdges()
     bool foundMismatch = false;
     foreach_block(compiler, block)
     {
-        if (block->isEmpty() && block->bbNum > bbNumMaxBeforeResolution)
-        {
-            continue;
-        }
         VarToRegMap toVarToRegMap = getInVarToRegMap(block->bbNum);
         for (flowList* pred = block->bbPreds; pred != nullptr; pred = pred->flNext)
         {
@@ -8677,70 +8759,59 @@ void LinearScan::resolveEdge(BasicBlock*      fromBlock,
                              ResolveType      resolveType,
                              VARSET_VALARG_TP liveSet)
 {
-    VarToRegMap fromVarToRegMap = getOutVarToRegMap(fromBlock->bbNum);
+    VarToRegMap fromVarToRegMap;
     VarToRegMap toVarToRegMap;
     if (resolveType == ResolveSharedCritical)
     {
-        toVarToRegMap = sharedCriticalVarToRegMap;
+        // For this case, we have a single block, and we will resolve its to/from vars to the shared set.
+        if (fromBlock == nullptr)
+        {
+            fromVarToRegMap = sharedCriticalVarToRegMap;
+            toVarToRegMap = getInVarToRegMap(toBlock->bbNum);
+            // Resolve this as if it were a split (i.e. we put the moves in 'toBlock'.
+            resolveType = ResolveSplit;
+        }
+        else
+        {
+            assert(toBlock == nullptr);
+            fromVarToRegMap = getOutVarToRegMap(fromBlock->bbNum);
+            toVarToRegMap = sharedCriticalVarToRegMap;
+            // Resolve this as if it were a join (i.e. we put the moves in 'fromBlock'.
+            resolveType = ResolveJoin;
+        }
     }
     else
     {
+        fromVarToRegMap = getOutVarToRegMap(fromBlock->bbNum);
         toVarToRegMap = getInVarToRegMap(toBlock->bbNum);
     }
 
     // The block to which we add the resolution moves depends on the resolveType
-    BasicBlock* block;
-    switch (resolveType)
-    {
-        case ResolveJoin:
-        case ResolveSharedCritical:
-            block = fromBlock;
-            break;
-        case ResolveSplit:
-            block = toBlock;
-            break;
-        case ResolveCritical:
-            // fgSplitEdge may add one or two BasicBlocks.  It returns the block that splits
-            // the edge from 'fromBlock' and 'toBlock', but if it inserts that block right after
-            // a block with a fall-through it will have to create another block to handle that edge.
-            // These new blocks can be mapped to existing blocks in order to correctly handle
-            // the calls to recordVarLocationsAtStartOfBB() from codegen.  That mapping is handled
-            // in resolveEdges(), after all the edge resolution has been done (by calling this
-            // method for each edge).
-            block = compiler->fgSplitEdge(fromBlock, toBlock);
+    assert((resolveType == ResolveJoin) || (resolveType == ResolveSplit));
+    BasicBlock* block = (resolveType == ResolveJoin) ? fromBlock : toBlock;
 
-            // Split edges are counted against fromBlock.
-            INTRACK_STATS(updateLsraStat(LSRA_STAT_SPLIT_EDGE, fromBlock->bbNum));
-            break;
-        default:
-            unreached();
-            break;
-    }
-
-#ifndef TARGET_XARCH
-    // We record tempregs for beginning and end of each block.
-    // For amd64/x86 we only need a tempReg for float - we'll use xchg for int.
-    // TODO-Throughput: It would be better to determine the tempRegs on demand, but the code below
-    // modifies the varToRegMaps so we don't have all the correct registers at the time
-    // we need to get the tempReg.
-    regNumber tempRegInt =
-        (resolveType == ResolveSharedCritical) ? REG_NA : getTempRegForResolution(fromBlock, toBlock, TYP_INT);
-#endif // !TARGET_XARCH
+    regMaskTP tempRegMask = getTempRegsForResolution(fromVarToRegMap, toVarToRegMap, liveSet);
+#ifndef _TARGET_XARCH_
+    regMaskTP tempRegIntMask = (tempRegMask & allRegs(TYP_INT));
+    regNumber tempRegInt = (tempRegIntMask == RBM_NONE) ? REG_NA : genRegNumFromMask(genFindLowestBit(tempRegIntMask));
+#endif // !_TARGET_XARCH_
     regNumber tempRegFlt = REG_NA;
     regNumber tempRegDbl = REG_NA; // Used only for ARM
     if ((compiler->compFloatingPointUsed) && (resolveType != ResolveSharedCritical))
     {
-#ifdef TARGET_ARM
+#ifdef _TARGET_ARM_
         // Try to reserve a double register for TYP_DOUBLE and use it for TYP_FLOAT too if available.
-        tempRegDbl = getTempRegForResolution(fromBlock, toBlock, TYP_DOUBLE);
+        regMaskTP tempRegDblMask = (tempRegMask & RBM_ALLDOUBLE);
+        tempRegDbl = (tempRegDblMask == RBM_NONE) ? REG_NA : genRegNumFromMask(genFindLowestBit(tempRegDblMask));
         if (tempRegDbl != REG_NA)
         {
             tempRegFlt = tempRegDbl;
         }
         else
-#endif // TARGET_ARM
+#endif // _TARGET_ARM_
         {
-            tempRegFlt = getTempRegForResolution(fromBlock, toBlock, TYP_FLOAT);
+            regMaskTP tempRegFltMask = (tempRegMask & RBM_ALLFLOAT);
+            tempRegFlt = (tempRegFltMask == RBM_NONE) ? REG_NA : genRegNumFromMask(genFindLowestBit(tempRegFltMask));
         }
     }
 
@@ -8778,7 +8849,7 @@ void LinearScan::resolveEdge(BasicBlock*      fromBlock,
 
     // Get the starting insertion point for the "to" resolution
     GenTree* insertionPoint = nullptr;
-    if (resolveType == ResolveSplit || resolveType == ResolveCritical)
+    if (resolveType == ResolveSplit)
     {
         insertionPoint = LIR::AsRange(block).FirstNonPhiNode();
     }
@@ -8837,13 +8908,11 @@ void LinearScan::resolveEdge(BasicBlock*      fromBlock,
                 continue;
             }
         }
-        // For Critical edges, the location will not change on either side of the edge,
-        // since we'll add a new block to do the move.
         if (resolveType == ResolveSplit)
         {
             setVarReg(toVarToRegMap, varIndex, fromReg);
         }
-        else if (resolveType == ResolveJoin || resolveType == ResolveSharedCritical)
+        else
         {
             setVarReg(fromVarToRegMap, varIndex, toReg);
         }
@@ -9136,13 +9205,6 @@ void LinearScan::resolveEdge(BasicBlock*      fromBlock,
 //
 void LinearScan::updateLsraStat(LsraStat stat, unsigned bbNum)
 {
-    if (bbNum > bbNumMaxBeforeResolution)
-    {
-        // This is a newly created basic block as part of resolution.
-        // These blocks contain resolution moves that are already accounted.
-        return;
-    }
-
     switch (stat)
     {
         case LSRA_STAT_SPILL:
@@ -9203,11 +9265,6 @@ void LinearScan::dumpLsraStats(FILE* file)
 
     for (BasicBlock* block = compiler->fgFirstBB; block != nullptr; block = block->bbNext)
     {
-        if (block->bbNum > bbNumMaxBeforeResolution)
-        {
-            continue;
-        }
-
         unsigned spillCount         = blockInfo[block->bbNum].spillCount;
         unsigned copyRegCount       = blockInfo[block->bbNum].copyRegCount;
         unsigned resolutionMovCount = blockInfo[block->bbNum].resolutionMovCount;
@@ -9414,10 +9471,6 @@ void Interval::dump()
     {
         printf(" (field)");
     }
-    if (isPromotedStruct)
-    {
-        printf(" (promoted struct)");
-    }
     if (hasConflictingDefUse)
     {
         printf(" (def-use conflict)");
@@ -9433,6 +9486,10 @@ void Interval::dump()
     if (isConstant)
     {
         printf(" (constant)");
+    }
+    if (hasCriticalPref)
+    {
+        printf(" (criticalPref)");
     }
     if (isWriteThru)
     {
@@ -9852,20 +9909,10 @@ void LinearScan::TupleStyleDump(LsraTupleDumpMode mode)
             block->dspBlockHeader(compiler);
             printf("=====\n");
         }
-        if (enregisterLocalVars && mode == LSRA_DUMP_POST && block != compiler->fgFirstBB &&
-            block->bbNum <= bbNumMaxBeforeResolution)
+        if (enregisterLocalVars && mode == LSRA_DUMP_POST && block != compiler->fgFirstBB)
         {
             printf("Predecessor for variable locations: " FMT_BB "\n", blockInfo[block->bbNum].predBBNum);
             dumpInVarToRegMap(block);
-        }
-        if (block->bbNum > bbNumMaxBeforeResolution)
-        {
-            SplitEdgeInfo splitEdgeInfo;
-            splitBBNumToTargetBBNumMap->Lookup(block->bbNum, &splitEdgeInfo);
-            assert(splitEdgeInfo.toBBNum <= bbNumMaxBeforeResolution);
-            assert(splitEdgeInfo.fromBBNum <= bbNumMaxBeforeResolution);
-            printf("New block introduced for resolution from " FMT_BB " to " FMT_BB "\n", splitEdgeInfo.fromBBNum,
-                   splitEdgeInfo.toBBNum);
         }
 
         for (GenTree* node : LIR::AsRange(block).NonPhiNodes())
@@ -11033,90 +11080,6 @@ void LinearScan::verifyFinalAllocation()
         }
     }
 
-    // Now, verify the resolution blocks.
-    // Currently these are nearly always at the end of the method, but that may not always be the case.
-    // So, we'll go through all the BBs looking for blocks whose bbNum is greater than bbNumMaxBeforeResolution.
-    for (BasicBlock* currentBlock = compiler->fgFirstBB; currentBlock != nullptr; currentBlock = currentBlock->bbNext)
-    {
-        if (currentBlock->bbNum > bbNumMaxBeforeResolution)
-        {
-            // If we haven't enregistered an lclVars, we have no resolution blocks.
-            assert(enregisterLocalVars);
-
-            if (VERBOSE)
-            {
-                dumpRegRecordTitle();
-                printf(shortRefPositionFormat, 0, 0);
-                assert(currentBlock->bbPreds != nullptr && currentBlock->bbPreds->flBlock != nullptr);
-                printf(bbRefPosFormat, currentBlock->bbNum, currentBlock->bbPreds->flBlock->bbNum);
-                dumpRegRecords();
-            }
-
-            // Clear register assignments.
-            for (regNumber reg = REG_FIRST; reg < ACTUAL_REG_COUNT; reg = REG_NEXT(reg))
-            {
-                RegRecord* physRegRecord        = getRegisterRecord(reg);
-                physRegRecord->assignedInterval = nullptr;
-            }
-
-            // Set the incoming register assignments
-            VarToRegMap     inVarToRegMap = getInVarToRegMap(currentBlock->bbNum);
-            VarSetOps::Iter iter(compiler, currentBlock->bbLiveIn);
-            unsigned        varIndex = 0;
-            while (iter.NextElem(&varIndex))
-            {
-                if (localVarIntervals[varIndex] == nullptr)
-                {
-                    assert(!compiler->lvaGetDescByTrackedIndex(varIndex)->lvLRACandidate);
-                    continue;
-                }
-                regNumber regNum                  = getVarReg(inVarToRegMap, varIndex);
-                Interval* interval                = getIntervalForLocalVar(varIndex);
-                interval->physReg                 = regNum;
-                interval->assignedReg             = &(physRegs[regNum]);
-                interval->isActive                = true;
-                physRegs[regNum].assignedInterval = interval;
-            }
-
-            // Verify the moves in this block
-            LIR::Range& currentBlockRange = LIR::AsRange(currentBlock);
-            for (GenTree* node : currentBlockRange.NonPhiNodes())
-            {
-                assert(IsResolutionNode(currentBlockRange, node));
-                if (IsResolutionMove(node))
-                {
-                    // Only verify nodes that are actually moves; don't bother with the nodes that are
-                    // operands to moves.
-                    verifyResolutionMove(node, currentLocation);
-                }
-            }
-
-            // Verify the outgoing register assignments
-            {
-                VarToRegMap     outVarToRegMap = getOutVarToRegMap(currentBlock->bbNum);
-                VarSetOps::Iter iter(compiler, currentBlock->bbLiveOut);
-                unsigned        varIndex = 0;
-                while (iter.NextElem(&varIndex))
-                {
-                    if (localVarIntervals[varIndex] == nullptr)
-                    {
-                        assert(!compiler->lvaGetDescByTrackedIndex(varIndex)->lvLRACandidate);
-                        continue;
-                    }
-                    regNumber regNum   = getVarReg(outVarToRegMap, varIndex);
-                    Interval* interval = getIntervalForLocalVar(varIndex);
-                    // Either the register assignments match, or the outgoing assignment is on the stack
-                    // and this is a write-thru interval.
-                    assert(interval->physReg == regNum || (interval->physReg == REG_NA && regNum == REG_STK) ||
-                           (interval->isWriteThru && regNum == REG_STK));
-                    interval->physReg     = REG_NA;
-                    interval->assignedReg = nullptr;
-                    interval->isActive    = false;
-                }
-            }
-        }
-    }
-
     DBEXEC(VERBOSE, printf("\n"));
 }
 
@@ -11218,6 +11181,83 @@ void LinearScan::verifyResolutionMove(GenTree* resolutionMove, LsraLocation curr
         printf("  Move   ");
         printf("      %-4s ", getRegName(dstRegNum));
         dumpRegRecords();
+    }
+}
+
+void
+LinearScan::dumpBlockSequence()
+{
+    JITDUMP("LSRA Block Sequence: ");
+    for (BasicBlock *block = startBlockSequence(); block != nullptr; block = moveToNextBlock())
+    {
+        JITDUMP(FMT_BB, block->bbNum);
+
+        if (block->isMaxBBWeight())
+        {
+            JITDUMP("( MAX ) ");
+        }
+        else
+        {
+            JITDUMP("(%5s) ", refCntWtd2str(block->getBBWeight(compiler)));
+        }
+
+        if (blockInfo[block->bbNum].hasEHBoundaryIn)
+        {
+            JITDUMP(" EH-in");
+        }
+        if (blockInfo[block->bbNum].hasEHBoundaryOut)
+        {
+            JITDUMP(" EH-out");
+        }
+        JITDUMP("\n");
+    }
+    JITDUMP("\n");
+}
+
+void LinearScan::validateAndDumpCriticalEdgeSet(CriticalEdgeSet* thisSet)
+{
+    bool isValidSet = thisSet->isValid;
+    bool isConsistent = true;
+    JITDUMP("CriticalEdgeSet %d: %s", thisSet->index, isValidSet ? "Valid" : "Invalid");
+    if (isValidSet)
+    {
+        JITDUMP(", masterBlock BB%02u", thisSet->masterBlock->bbNum);
+    }
+    JITDUMP("\n  Out Set (preds): ");
+    for (Compiler::BlockListNode* listNode = thisSet->OutEdgeBBList; listNode != nullptr; listNode = listNode->m_next)
+    {
+        unsigned nextOutBlockNum = listNode->m_blk->bbNum;
+        bool isInSet = (blockInfo[nextOutBlockNum].criticalOutEdgeIndex == thisSet->index);
+        JITDUMP(" BB%02u", nextOutBlockNum);
+        if (isInSet != isValidSet)
+        {
+            JITDUMP("*");
+            isConsistent = false;
+        }
+    }
+    JITDUMP("\n  In Set (succs): ");
+    for (Compiler::BlockListNode* listNode = thisSet->InEdgeBBList; listNode != nullptr; listNode = listNode->m_next)
+    {
+        unsigned nextInBlockNum     = listNode->m_blk->bbNum;
+        bool isInSet = (blockInfo[nextInBlockNum].criticalInEdgeIndex == thisSet->index);
+        JITDUMP(" BB%02u", nextInBlockNum);
+        if (isInSet != isValidSet)
+        {
+            JITDUMP("*");
+            isConsistent = false;
+        }
+    }
+    JITDUMP("\n");
+    assert(isConsistent);
+}
+
+void
+LinearScan::validateAndDumpCriticalEdgeSets()
+{
+    for (int i = 0; i < criticalEdgeSets.Height(); i++)
+    {
+        CriticalEdgeSet* thisSet = getCriticalEdgeSet(i);
+        validateAndDumpCriticalEdgeSet(thisSet);
     }
 }
 #endif // DEBUG

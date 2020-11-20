@@ -375,14 +375,16 @@ public:
     void ReturnNode(RefInfoListNode* listNode);
 };
 
+typedef unsigned CriticalEdgeSetIndex;
+
 struct LsraBlockInfo
 {
     // bbNum of the predecessor to use for the register location of live-in variables.
     // 0 for fgFirstBB.
     unsigned int         predBBNum;
     BasicBlock::weight_t weight;
-    bool                 hasCriticalInEdge : 1;
-    bool                 hasCriticalOutEdge : 1;
+    CriticalEdgeSetIndex criticalInEdgeIndex;
+    CriticalEdgeSetIndex criticalOutEdgeIndex;
     bool                 hasEHBoundaryIn : 1;
     bool                 hasEHBoundaryOut : 1;
     bool                 hasEHPred : 1;
@@ -611,6 +613,7 @@ class LinearScan : public LinearScanInterface
     friend class RefPosition;
     friend class Interval;
     friend class Lowering;
+    friend struct LsraBlockInfo;
 
 public:
     // This could use further abstraction.  From Compiler we need the tree,
@@ -701,7 +704,98 @@ public:
     void addResolution(
         BasicBlock* block, GenTree* insertionPoint, Interval* interval, regNumber outReg, regNumber inReg);
 
-    void handleOutgoingCriticalEdges(BasicBlock* block);
+    struct CriticalEdgeSet {
+        Compiler::BlockListNode* OutEdgeBBList; // List of all bbs (predecessors) that have an outgoing edge into this CriticalEdgeSet.
+        Compiler::BlockListNode* InEdgeBBList;  // List of all bbs (successors) that have an incoming edge from this CriticalEdgeSet.
+        CriticalEdgeSetIndex     index;
+        BasicBlock*              masterBlock;
+        __declspec(property(get = getIsValid)) bool isValid;
+        bool getIsValid()
+        {
+            return masterBlock != nullptr;
+        }
+
+        CriticalEdgeSet(unsigned newIndex, BasicBlock* block)
+        {
+            noway_assert(block != nullptr);
+            index = newIndex;
+            masterBlock = block;
+            InEdgeBBList = nullptr;
+            OutEdgeBBList = nullptr;
+        }
+        void updateMasterBlock(BasicBlock* block)
+        {
+            if (block->bbWeight > masterBlock->bbWeight)
+            {
+                masterBlock = block;
+            }
+        }
+
+        void addToInEdges(Compiler::BlockListNode* node)
+        {
+            assert(!InEdgeBBList->contains(node->m_blk));
+            node->m_next = InEdgeBBList;
+            InEdgeBBList = node;
+            updateMasterBlock(node->m_blk);
+        }
+        void addToOutEdges(Compiler::BlockListNode* node)
+        {
+            assert(!OutEdgeBBList->contains(node->m_blk));
+            node->m_next = OutEdgeBBList;
+            OutEdgeBBList = node;
+            updateMasterBlock(node->m_blk);
+        }
+#ifdef DEBUG
+        // These search the list linearly, so we don't want to use these in Release.
+        bool inEdgeContains(BasicBlock* block)
+        {
+            return InEdgeBBList->contains(block);
+        }
+        bool outEdgeContains(BasicBlock* block)
+        {
+            return OutEdgeBBList->contains(block);
+        }
+#endif
+    };
+    void makeNewCriticalEdgeSet(CriticalEdgeSetIndex newIndex, BasicBlock* block)
+    {
+        assert(newIndex == (CriticalEdgeSetIndex)criticalEdgeSets.Height());
+        criticalEdgeSets.Emplace(newIndex, block);
+        criticalEdgeSetCount++;
+        assert(criticalEdgeSetCount == (CriticalEdgeSetIndex)criticalEdgeSets.Height());
+    }
+
+    // Merge otherSet into edgeSet, and mark it invalid.
+    void mergeCriticalEdgeSets(CriticalEdgeSet* edgeSet, CriticalEdgeSet* otherSet)
+    {
+        CriticalEdgeSetIndex thisIndex = edgeSet->index;
+        for (Compiler::BlockListNode* listNode = otherSet->InEdgeBBList; listNode != nullptr; listNode = listNode->m_next)
+        {
+            LsraBlockInfo* otherBlockInfo = &blockInfo[listNode->m_blk->bbNum];
+            assert(otherBlockInfo->criticalInEdgeIndex == otherSet->index);
+            otherBlockInfo->criticalInEdgeIndex = thisIndex;
+        }
+        edgeSet->InEdgeBBList->append(otherSet->InEdgeBBList);
+        for (Compiler::BlockListNode* listNode = otherSet->OutEdgeBBList; listNode != nullptr; listNode = listNode->m_next)
+        {
+            LsraBlockInfo* otherBlockInfo = &blockInfo[listNode->m_blk->bbNum];
+            assert(otherBlockInfo->criticalOutEdgeIndex == otherSet->index);
+            otherBlockInfo->criticalOutEdgeIndex = thisIndex;
+        }
+        edgeSet->OutEdgeBBList->append(otherSet->OutEdgeBBList);
+        if (edgeSet->masterBlock->bbWeight < otherSet->masterBlock->bbWeight)
+        {
+            edgeSet->masterBlock = otherSet->masterBlock;
+        }
+        otherSet->masterBlock = nullptr;
+    }
+    void handleCriticalEdgeSet(CriticalEdgeSet* criticalEdgeSet);
+    void mergeCriticalInSets(BasicBlock* block);
+    void mergeCriticalOutSets(BasicBlock* block);
+    CriticalEdgeSet* getCriticalEdgeSet(CriticalEdgeSetIndex index)
+    {
+        return &(criticalEdgeSets.TopRef(criticalEdgeSets.Height() - index - 1));
+    }
 
     void resolveEdge(BasicBlock* fromBlock, BasicBlock* toBlock, ResolveType resolveType, VARSET_VALARG_TP liveSet);
 
@@ -890,6 +984,9 @@ private:
     void lsraDumpIntervals(const char* msg);
     void dumpRefPositions(const char* msg);
     void dumpVarRefPositions(const char* msg);
+    void dumpBlockSequence();
+    void validateAndDumpCriticalEdgeSet(CriticalEdgeSet* thisSet);
+    void validateAndDumpCriticalEdgeSets();
 
     // Checking code
     static bool IsLsraAdded(GenTree* node)
@@ -939,6 +1036,8 @@ private:
     {
         return false;
     }
+    void dumpBlockSequence() {}
+    void validateAndDumpCriticalEdgeSets() {}
 #endif // !DEBUG
 
 public:
@@ -1180,15 +1279,6 @@ private:
     // TODO-Throughput: Consider refactoring this so that we keep a map from regs to vars for better scaling
     unsigned int regMapCount;
 
-    // When we split edges, we create new blocks, and instead of expanding the VarToRegMaps, we
-    // rely on the property that the "in" map is the same as the "from" block of the edge, and the
-    // "out" map is the same as the "to" block of the edge (by construction).
-    // So, for any block whose bbNum is greater than bbNumMaxBeforeResolution, we use the
-    // splitBBNumToTargetBBNumMap.
-    // TODO-Throughput: We may want to look into the cost/benefit tradeoff of doing this vs. expanding
-    // the arrays.
-
-    unsigned bbNumMaxBeforeResolution;
     struct SplitEdgeInfo
     {
         unsigned fromBBNum;
@@ -1214,11 +1304,14 @@ private:
     VarToRegMap getOutVarToRegMap(unsigned int bbNum);
     void setVarReg(VarToRegMap map, unsigned int trackedVarIndex, regNumber reg);
     regNumber getVarReg(VarToRegMap map, unsigned int trackedVarIndex);
-    // Initialize the incoming VarToRegMap to the given map values (generally a predecessor of
-    // the block)
-    VarToRegMap setInVarToRegMap(unsigned int bbNum, VarToRegMap srcVarToRegMap);
+    // Copy a VarToRegMap to another.
+    void copyVarToRegMap(VarToRegMap dstVarToRegMap, VarToRegMap srcVarToRegMap)
+    {
+        memcpy(dstVarToRegMap, srcVarToRegMap, (regMapCount * sizeof(regNumberSmall)));
+    }
 
-    regNumber getTempRegForResolution(BasicBlock* fromBlock, BasicBlock* toBlock, var_types type);
+
+    regMaskTP getTempRegsForResolution(VarToRegMap fromVarToRegMap, VarToRegMap toVarToRegMapk, VARSET_VALARG_TP liveSet);
 
 #ifdef DEBUG
     void dumpVarToRegMap(VarToRegMap map);
@@ -1417,8 +1510,14 @@ private:
     unsigned int bbSeqCount;
     // The Location of the start of the current block.
     LsraLocation curBBStartLocation;
+
+    bool criticalEdgeResolutionComplete;
     // True if the method contains any critical edges.
     bool hasCriticalEdges;
+    static const CriticalEdgeSetIndex CriticalEdgeSetInvalid = UINT_MAX;
+    // This should be a property returning criticalEdgeSets.Height();
+    CriticalEdgeSetIndex criticalEdgeSetCount;
+    ArrayStack<CriticalEdgeSet> criticalEdgeSets;
 
     // True if there are any register candidate lclVars available for allocation.
     bool enregisterLocalVars;
@@ -1651,12 +1750,12 @@ public:
         , isSpilled(false)
         , isInternal(false)
         , isStructField(false)
-        , isPromotedStruct(false)
         , hasConflictingDefUse(false)
         , hasInterferingUses(false)
         , isSpecialPutArg(false)
         , preferCalleeSave(false)
         , isConstant(false)
+        , hasCriticalPref(false)
 #if FEATURE_PARTIAL_SIMD_CALLEE_SAVE
         , isUpperVector(false)
         , isPartiallySpilled(false)
@@ -1714,8 +1813,6 @@ public:
     bool isInternal : 1;
     // true if this is a LocalVar for a struct field
     bool isStructField : 1;
-    // true iff this is a GT_LDOBJ for a fully promoted (PROMOTION_TYPE_INDEPENDENT) struct
-    bool isPromotedStruct : 1;
     // true if this is an SDSU interval for which the def and use have conflicting register
     // requirements
     bool hasConflictingDefUse : 1;
@@ -1735,6 +1832,9 @@ public:
     // True if this interval is defined by a constant node that may be reused and/or may be
     // able to reuse a constant that's already in a register.
     bool isConstant : 1;
+
+    // true iff this is an interval that's live on a critical edge.
+    bool hasCriticalPref : 1;
 
 #if FEATURE_PARTIAL_SIMD_CALLEE_SAVE
     // True if this is a special interval for saving the upper half of a large vector.
@@ -1894,6 +1994,10 @@ public:
 
     void updateRegisterPreferences(regMaskTP preferences)
     {
+        if (hasCriticalPref)
+        {
+            return;
+        }
         // If this interval is preferenced, that interval may have already been assigned a
         // register, and we want to include that in the preferences.
         if ((relatedInterval != nullptr) && !relatedInterval->isActive)

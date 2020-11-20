@@ -4318,6 +4318,36 @@ private:
         {
         }
         void* operator new(size_t sz, Compiler* comp);
+        void append(BlockListNode* other)
+        {
+            BlockListNode* prevList = nullptr;
+            for (BlockListNode* listNode = this; listNode != nullptr; listNode = listNode->m_next)
+            {
+                prevList = listNode;
+            }
+            prevList->m_next = other;
+        }
+#ifdef DEBUG
+        bool contains(BasicBlock* block)
+        {
+            for (BlockListNode* listNode = this; listNode != nullptr; listNode = listNode->m_next)
+            {
+                if (listNode->m_blk == block)
+                {
+                    return true;
+                }
+            }
+            return false;
+        }
+        void dump()
+        {
+            for (Compiler::BlockListNode* listNode = this; listNode != nullptr; listNode = listNode->m_next)
+            {
+                JITDUMP(" BB%02u", listNode->m_blk->bbNum);
+            }
+            JITDUMP("\n");
+        }
+#endif // DEBUG
     };
     BlockListNode* impBlockListNodeFreeList;
 

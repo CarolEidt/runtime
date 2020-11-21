@@ -942,6 +942,7 @@ void LinearScan::setBlockSequence()
         thisBlockInfo->weight             = block->getBBWeight(compiler);
         thisBlockInfo->hasEHBoundaryIn    = block->hasEHBoundaryIn();
         thisBlockInfo->hasEHBoundaryOut   = block->hasEHBoundaryOut();
+        thisBlockInfo->hasEHPred          = false;
 
 #if TRACK_LSRA_STATS
         thisBlockInfo->spillCount         = 0;
@@ -8426,7 +8427,7 @@ void LinearScan::handleCriticalEdgeSet(CriticalEdgeSet* criticalEdgeSet)
         dumpVarToRegMap(sharedCriticalVarToRegMap);
     }
 #endif
-    short edgeRegCount[REG_COUNT];
+    unsigned edgeRegWeight[REG_COUNT];
     regMaskTP      edgeRegs;
     VarSetOps::Iter diffVarIter(compiler, diffResolutionSet);
     unsigned diffVarIndex = 0;
@@ -8434,71 +8435,72 @@ void LinearScan::handleCriticalEdgeSet(CriticalEdgeSet* criticalEdgeSet)
     {
         // The candidate registers for this lclVar.
         edgeRegs = RBM_NONE;
-        // We'll initialize the actual regs' count when we add them to 'edgeRegs'.
-        edgeRegCount[REG_STK] = 0;
+        // We'll initialize the actual regs' weight when we add them to 'edgeRegs'.
+        edgeRegWeight[REG_STK] = BB_ZERO_WEIGHT;
 
         // Iterate over all of the edges to find the most frequent location, which may be REG_STK.
         for (Compiler::BlockListNode* listNode = criticalEdgeSet->OutEdgeBBList; listNode != nullptr; listNode = listNode->m_next)
         {
             curBlock = listNode->m_blk;
+            unsigned thisBlockWeight = curBlock->getBBWeight(compiler);
             VarToRegMap outVarToRegMap = getOutVarToRegMap(curBlock->bbNum);
             regNumber reg = getVarReg(outVarToRegMap, diffVarIndex);
             if (VarSetOps::IsMember(compiler, curBlock->bbLiveOut, diffVarIndex) && genIsValidReg(reg) && ((reg == REG_STK) || ((liveOutRegs & genRegMask(reg)) == RBM_NONE)))
             {
                 if (reg == REG_STK)
                 {
-                    edgeRegCount[REG_STK]++;
+                    edgeRegWeight[REG_STK] += thisBlockWeight;
                 }
                 else if ((edgeRegs & genRegMask(reg)) == RBM_NONE)
                 {
                     edgeRegs |= genRegMask(reg);
-                    edgeRegCount[reg] = 1;
+                    edgeRegWeight[reg] = thisBlockWeight;
                 }
                 else
                 {
-                    edgeRegCount[reg]++;
+                    edgeRegWeight[reg] += thisBlockWeight;
                 }
             }
         }
         for (Compiler::BlockListNode* listNode = criticalEdgeSet->InEdgeBBList; listNode != nullptr; listNode = listNode->m_next)
         {
             curBlock = listNode->m_blk;
+            unsigned thisBlockWeight = curBlock->getBBWeight(compiler);
             VarToRegMap inVarToRegMap = getInVarToRegMap(curBlock->bbNum);
             regNumber reg = getVarReg(inVarToRegMap, diffVarIndex);
             if (VarSetOps::IsMember(compiler, curBlock->bbLiveIn, diffVarIndex) && genIsValidReg(reg) && ((reg == REG_STK) || ((liveOutRegs & genRegMask(reg)) == RBM_NONE)))
             {
                 if (reg == REG_STK)
                 {
-                    edgeRegCount[REG_STK]++;
+                    edgeRegWeight[REG_STK] += thisBlockWeight;
                 }
                 else if ((edgeRegs & genRegMask(reg)) == RBM_NONE)
                 {
                     edgeRegs |= genRegMask(reg);
-                    edgeRegCount[reg] = 1;
+                    edgeRegWeight[reg] = thisBlockWeight;
                 }
                 else
                 {
-                    edgeRegCount[reg]++;
+                    edgeRegWeight[reg] += thisBlockWeight;
                 }
             }
         }
-        regNumber reg = REG_NA;
-        short regCount = 0;
+        regNumber reg = REG_STK;
+        unsigned regWeight = edgeRegWeight[REG_STK];
         while (edgeRegs != RBM_NONE)
         {
             regMaskTP nextRegMask = genFindLowestBit(edgeRegs);
             regNumber nextReg = genRegNumFromMask(nextRegMask);
             edgeRegs &= ~nextRegMask;
-            if (edgeRegCount[nextReg] > regCount)
+            if (edgeRegWeight[nextReg] > regWeight)
             {
                 reg = nextReg;
-                regCount = edgeRegCount[nextReg];
+                regWeight = edgeRegWeight[nextReg];
             }
         }
 
-        if (reg == REG_NA)
+        if (reg == REG_STK)
         {
-            reg = REG_STK;
             setIntervalAsSpilled(getIntervalForLocalVar(diffVarIndex));
         }
         setVarReg(sharedCriticalVarToRegMap, diffVarIndex, reg);
@@ -8857,7 +8859,8 @@ void LinearScan::resolveEdge(BasicBlock*      fromBlock,
     // If this is an edge between EH regions, we may have "extra" live-out EH vars.
     // If we are adding resolution at the end of the block, we need to create "virtual" moves
     // for these so that their registers are freed and can be reused.
-    if ((resolveType == ResolveJoin) && (compiler->compHndBBtabCount > 0))
+    // TODO: Figure out how to handle this for critical edges.
+    if ((resolveType == ResolveJoin) && (compiler->compHndBBtabCount > 0) && (block != nullptr) && (toBlock != nullptr))
     {
         VARSET_TP extraLiveSet(VarSetOps::Diff(compiler, block->bbLiveOut, toBlock->bbLiveIn));
         VarSetOps::IntersectionD(compiler, extraLiveSet, registerCandidateVars);

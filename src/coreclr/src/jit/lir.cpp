@@ -1741,6 +1741,6 @@ void LIR::InsertBeforeTerminator(BasicBlock* block, LIR::Range&& range)
 #ifdef DEBUG
 void GenTree::dumpLIRFlags()
 {
-    JITDUMP("[%c%c]", IsUnusedValue() ? 'U' : '-', IsRegOptional() ? 'O' : '-');
+    JITDUMP("[%c%c]", IsUnusedValue() ? 'U' : '-', IsRegOptionalUse() ? 'O' : IsRegOptionalDef() ? 'o' : '-');
 }
 #endif

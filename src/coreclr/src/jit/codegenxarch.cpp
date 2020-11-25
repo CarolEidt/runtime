@@ -654,7 +654,7 @@ void CodeGen::genCodeForMulHi(GenTreeOp* treeNode)
     {
         ins = INS_mulEAX;
     }
-    emit->emitInsBinary(ins, size, treeNode, rmOp);
+    emit->emitInsBinaryRMW(ins, size, treeNode, regOp, rmOp);
 
     // Move the result to the desired register, if necessary
     if (treeNode->OperGet() == GT_MULHI && targetReg != REG_RDX)
@@ -811,7 +811,7 @@ void CodeGen::genCodeForDivMod(GenTreeOp* treeNode)
         ins = INS_idiv;
     }
 
-    emit->emitInsBinary(ins, size, treeNode, divisor);
+        emit->emitInsBinaryRMW(ins, size, treeNode, dividend, divisor);
 
     // DIV/IDIV instructions always store the quotient in RAX and the remainder in RDX.
     // Move the result to the desired register, if necessary
@@ -874,21 +874,32 @@ void CodeGen::genCodeForBinary(GenTreeOp* treeNode)
     GenTree* op1 = treeNode->gtGetOp1();
     GenTree* op2 = treeNode->gtGetOp2();
 
-    // Commutative operations can mark op1 as contained or reg-optional to generate "op reg, memop/immed"
-    if (!op1->isUsedFromReg())
+    if (targetReg == REG_NA)
     {
+        // Either op1->isUsedFromSpillTemp(), or op2->isUsedFromSpillTemp() and the op is commutative.
+        if (op2->isUsedFromSpillTemp())
+        {
+            GenTree* tmp = op1;
+            op1 = op2;
+            op2 = tmp;
+        }
+        else
+        {
+            assert(op1->isUsedFromSpillTemp());
+        }
+    }
+    else if (!op1->isUsedFromReg())
+    {
+        // Commutative operations can mark op1 as contained or reg-optional to generate "op reg, memop/immed"
         assert(treeNode->OperIsCommutative());
         assert(op1->isMemoryOp() || op1->IsLocal() || op1->IsCnsNonZeroFltOrDbl() || op1->IsIntCnsFitsInI32() ||
-               op1->IsRegOptional());
+               op1->IsRegOptionalUse());
 
         op1 = treeNode->gtGetOp2();
         op2 = treeNode->gtGetOp1();
     }
 
     instruction ins = genGetInsForOper(treeNode->OperGet(), targetType);
-
-    // The arithmetic node must be sitting in a register (since it's not contained)
-    noway_assert(targetReg != REG_NA);
 
     regNumber op1reg = op1->isUsedFromReg() ? op1->GetRegNum() : REG_NA;
     regNumber op2reg = op2->isUsedFromReg() ? op2->GetRegNum() : REG_NA;
@@ -908,8 +919,8 @@ void CodeGen::genCodeForBinary(GenTreeOp* treeNode)
     GenTree* dst;
     GenTree* src;
 
-    // This is the case of reg1 = reg1 op reg2
-    // We're ready to emit the instruction without any moves
+    // This is the case of "reg1 op= reg2" or "[spill-temp] op= reg2".
+    // We're ready to emit the instruction without any moves.
     if (op1reg == targetReg)
     {
         dst = op1;
@@ -974,7 +985,7 @@ void CodeGen::genCodeForBinary(GenTreeOp* treeNode)
             return;
         }
     }
-    regNumber r = emit->emitInsBinary(ins, emitTypeSize(treeNode), dst, src);
+    regNumber r = emit->emitInsBinaryRMW(ins, emitTypeSize(treeNode), treeNode, dst, src);
     noway_assert(r == targetReg);
 
     if (treeNode->gtOverflowEx())
@@ -1072,7 +1083,7 @@ void CodeGen::genCodeForMul(GenTreeOp* treeNode)
         {
             // use the 3-op form with immediate
             ins = GetEmitter()->inst3opImulForReg(targetReg);
-            emit->emitInsBinary(ins, size, rmOp, immOp);
+            emit->emitInsBinaryRMW(ins, size, treeNode, rmOp, immOp);
         }
     }
     else // we have no contained immediate operand
@@ -1107,7 +1118,7 @@ void CodeGen::genCodeForMul(GenTreeOp* treeNode)
             inst_RV_RV(INS_mov, mulTargetReg, regOp->GetRegNum(), targetType);
         }
 
-        emit->emitInsBinary(ins, size, treeNode, rmOp);
+        emit->emitInsBinaryRMW(ins, size, treeNode, regOp, rmOp);
 
         // Move the result to the desired register, if necessary
         if ((ins == INS_mulEAX) && (targetReg != REG_RAX))
@@ -1378,7 +1389,7 @@ void CodeGen::genCodeForReturnTrap(GenTreeOp* tree)
     genConsumeRegs(data);
     GenTreeIntCon cns = intForm(TYP_INT, 0);
     cns.SetContained();
-    GetEmitter()->emitInsBinary(INS_cmp, emitTypeSize(TYP_INT), data, &cns);
+	GetEmitter()->emitInsBinary(INS_cmp, emitTypeSize(TYP_INT), data, &cns);
 
     BasicBlock* skipLabel = genCreateTempLabel();
 
@@ -3732,7 +3743,7 @@ void CodeGen::genRangeCheck(GenTree* oper)
     assert(emitTypeSize(bndsChkType) >= emitTypeSize(src1->TypeGet()));
 #endif // DEBUG
 
-    GetEmitter()->emitInsBinary(cmpKind, emitTypeSize(bndsChkType), src1, src2);
+    GetEmitter()->emitInsBinaryRMW(INS_cmp, emitTypeSize(bndsChkType), nullptr, src1, src2);
     genJumpToThrowHlpBlk(jmpKind, bndsChk->gtThrowKind, bndsChk->gtIndRngFailBB);
 }
 
@@ -4363,7 +4374,7 @@ void CodeGen::genCodeForStoreLclFld(GenTreeLclFld* tree)
     assert(genTypeSize(genActualType(targetType)) == genTypeSize(genActualType(op1->TypeGet())));
 
     genConsumeRegs(op1);
-    GetEmitter()->emitInsBinary(ins_Store(targetType), emitTypeSize(tree), tree, op1);
+	GetEmitter()->emitInsBinary(ins_Store(targetType), emitTypeSize(tree), tree, op1);
 
     // Updating variable liveness after instruction was emitted
     genUpdateLife(tree);
@@ -7472,7 +7483,7 @@ void CodeGen::genPutArgStkFieldList(GenTreePutArgStk* putArgStk)
                 if (fieldNode->isUsedFromSpillTemp())
                 {
                     assert(!varTypeIsSIMD(fieldType)); // Q: can we get here with SIMD?
-                    assert(fieldNode->IsRegOptional());
+                    assert(fieldNode->IsRegOptionalUse());
                     TempDsc* tmp = getSpillTempDsc(fieldNode);
                     GetEmitter()->emitIns_S(INS_push, emitActualTypeSize(fieldNode->TypeGet()), tmp->tdTempNum(), 0);
                     regSet.tmpRlsTemp(tmp);

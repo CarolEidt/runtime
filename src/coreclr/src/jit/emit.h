@@ -1699,7 +1699,11 @@ public:
 private:
     CORINFO_FIELD_HANDLE emitFltOrDblConst(double constValue, emitAttr attr);
     regNumber emitInsBinary(instruction ins, emitAttr attr, GenTree* dst, GenTree* src);
+#ifdef TARGET_XARCH
+    regNumber emitInsBinaryRMW(instruction ins, emitAttr attr, GenTree* dst, GenTree* src1, GenTree* src2);
+#endif
     regNumber emitInsTernary(instruction ins, emitAttr attr, GenTree* dst, GenTree* src1, GenTree* src2);
+    void emitInsMov(instruction ins, emitAttr attr, GenTree* node);
     void emitInsLoadInd(instruction ins, emitAttr attr, regNumber dstReg, GenTreeIndir* mem);
     void emitInsStoreInd(instruction ins, emitAttr attr, GenTreeStoreInd* mem);
     void emitInsStoreLcl(instruction ins, emitAttr attr, GenTreeLclVarCommon* varNode);

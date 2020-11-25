@@ -3589,7 +3589,7 @@ bool LinearScan::isSpillCandidate(Interval*     current,
         // TODO-CQ: At the time we allocate a register to a fixed-reg def, if it's not going
         // to remain live until the use, we should set the candidates to allRegs(regType)
         // to avoid a spill - codegen can then insert the copy.
-        // If this is marked as allocateIfProfitable, the caller will compare the weights
+        // If this is marked as RegOptional, the caller will compare the weights
         // of this RefPosition and the RefPosition to which it is currently assigned.
         assert(refPosition->isFixedRegRef ||
                (refPosition->nextRefPosition != nullptr && refPosition->nextRefPosition->isFixedRegRef) ||
@@ -7145,28 +7145,26 @@ void LinearScan::updateMaxSpill(RefPosition* refPosition)
 
             if (refPosition->spillAfter && !refPosition->reload)
             {
-                currentSpill[type]++;
-                if (currentSpill[type] > maxSpill[type])
-                {
-                    maxSpill[type] = currentSpill[type];
-                }
+				incrementSpill(type);
             }
             else if (refPosition->reload)
             {
-                assert(currentSpill[type] > 0);
-                currentSpill[type]--;
-            }
+				decrementSpill(type);
+			}
             else if (refPosition->RegOptional() && refPosition->assignedReg() == REG_NA)
             {
-                // A spill temp not getting reloaded into a reg because it is
-                // marked as allocate if profitable and getting used from its
-                // memory location.  To properly account max spill for typ we
-                // decrement spill count.
-                assert(RefTypeIsUse(refType));
-                assert(currentSpill[type] > 0);
-                currentSpill[type]--;
+                // This is a node that is either being used from or defined into a spill temp.
+                // If it is a definition, we will increment the spill count.
+                // If it is a use, we will decrement the spill count.
+                if (RefTypeIsUse(refType))
+                {
+					decrementSpill(type);
+				}
+                else
+                {
+					incrementSpill(type);
+				}
             }
-            JITDUMP("  Max spill for %s is %d\n", varTypeName(type), maxSpill[type]);
         }
     }
 }
@@ -7462,10 +7460,13 @@ void LinearScan::resolveRegisters()
                 // (local vars are handled in resolveLocalRef, above)
                 // Note that the tree node will be changed from GTF_SPILL to GTF_SPILLED
                 // in codegen, taking care of the "reload" case for temps
-                else if (currentRefPosition->spillAfter || (currentRefPosition->nextRefPosition != nullptr &&
-                                                            currentRefPosition->nextRefPosition->moveReg))
+                else if (!currentRefPosition->isLocalDefUse)
                 {
-                    if (treeNode != nullptr)
+                    // This is a tree temp that has a use.
+                    RefPosition* nextRefPosition = currentRefPosition->nextRefPosition;
+                    assert(nextRefPosition != nullptr);
+                    assert(currentRefPosition->isIntervalRef());
+                    if (currentRefPosition->spillAfter || nextRefPosition->moveReg || (currentRefPosition->assignedReg() == REG_NA))
                     {
                         if (currentRefPosition->spillAfter)
                         {
@@ -7507,55 +7508,76 @@ void LinearScan::resolveRegisters()
                         // a node to hold the register to which it should be reloaded
                         RefPosition* nextRefPosition = currentRefPosition->nextRefPosition;
                         noway_assert(nextRefPosition != nullptr);
-                        if (INDEBUG(alwaysInsertReload() ||)
-                                nextRefPosition->assignedReg() != currentRefPosition->assignedReg())
+                        if (INDEBUG(alwaysInsertReload() || )
+                            (nextRefPosition->assignedReg() != currentRefPosition->assignedReg()) ||
+                            (currentRefPosition->assignedReg() == REG_NA))
                         {
-#if FEATURE_PARTIAL_SIMD_CALLEE_SAVE
-                            // Note that we asserted above that this is an Interval RefPosition.
-                            Interval* currentInterval = currentRefPosition->getInterval();
-                            if (!currentInterval->isUpperVector && nextRefPosition->refType == RefTypeUpperVectorSave)
+                            if (nextRefPosition->assignedReg() != REG_NA)
                             {
-                                // The currentRefPosition is a spill of a tree temp.
-                                // These have no associated Restore, as we always spill if the vector is
-                                // in a register when this is encountered.
-                                // The nextRefPosition we're interested in (where we may need to insert a
-                                // reload or flag as GTF_NOREG_AT_USE) is the subsequent RefPosition.
-                                assert(!currentInterval->isLocalVar);
-                                nextRefPosition = nextRefPosition->nextRefPosition;
-                                assert(nextRefPosition->refType != RefTypeUpperVectorSave);
+                                insertCopyOrReload(block, treeNode, currentRefPosition->getMultiRegIdx(),
+                                    nextRefPosition);
                             }
-                            // UpperVector intervals may have unique assignments at each reference.
-                            if (!currentInterval->isUpperVector)
-#endif
+                            else
                             {
-                                if (nextRefPosition->assignedReg() != REG_NA)
+                                // In case of tree temps, if the def is spilled or written to a spill temp, and the
+                                // use didn't get a register, set a flag on the tree node to be treated as contained
+                                // at the point of its use.
+                                assert(nextRefPosition->RegOptional());
+#if FEATURE_PARTIAL_SIMD_CALLEE_SAVE
+                                // Note that we asserted above that this is an Interval RefPosition.
+                                Interval* currentInterval = currentRefPosition->getInterval();
+                                if (!currentInterval->isUpperVector && nextRefPosition->refType == RefTypeUpperVectorSave)
                                 {
-                                    insertCopyOrReload(block, treeNode, currentRefPosition->getMultiRegIdx(),
-                                                       nextRefPosition);
+                                    // The currentRefPosition is a spill of a tree temp.
+                                    // These have no associated Restore, as we always spill if the vector is
+                                    // in a register when this is encountered.
+                                    // The nextRefPosition we're interested in (where we may need to insert a
+                                    // reload or flag as GTF_NOREG_AT_USE) is the subsequent RefPosition.
+                                    assert(!currentInterval->isLocalVar);
+                                    nextRefPosition = nextRefPosition->nextRefPosition;
+                                    assert(nextRefPosition->refType != RefTypeUpperVectorSave);
                                 }
-                                else
+                                // UpperVector intervals may have unique assignments at each reference.
+                                if (!currentInterval->isUpperVector)
+#endif
                                 {
-                                    assert(nextRefPosition->RegOptional());
-
-                                    // In case of tree temps, if def is spilled and use didn't
-                                    // get a register, set a flag on tree node to be treated as
-                                    // contained at the point of its use.
-                                    if (currentRefPosition->spillAfter && currentRefPosition->refType == RefTypeDef &&
-                                        nextRefPosition->refType == RefTypeUse)
+                                    if (nextRefPosition->assignedReg() != REG_NA)
                                     {
+                                        insertCopyOrReload(block, treeNode, currentRefPosition->getMultiRegIdx(),
+                                            nextRefPosition);
+                                    }
+                                    else
+                                    {
+                                        assert(nextRefPosition->RegOptional());
+                                        assert(currentRefPosition->refType == RefTypeDef && nextRefPosition->refType == RefTypeUse);
+                                        assert(currentRefPosition->spillAfter || currentRefPosition->RegOptional());
                                         assert(nextRefPosition->treeNode == nullptr);
                                         treeNode->gtFlags |= GTF_NOREG_AT_USE;
+                                        if (currentRefPosition->assignedReg() == REG_NA)
+                                        {
+                                            treeNode->gtFlags |= GTF_SPILLED;
+                                            // In order to have marked this as regOptionalDef, it must have had at least one
+                                            // operand that was regOptionalUse. If it received a register and was not spilled,
+                                            // set it as spilled so can use its spill location as the def location for this node.
+                                            assert(treeNode->OperIsUnary() || treeNode->OperIsBinary());
+                                            GenTree* regOptionalSrc = treeNode->gtGetOp1();
+                                            if (treeNode->OperIsBinary() && !regOptionalSrc->IsRegOptionalUse())
+                                            {
+                                                regOptionalSrc = treeNode->gtGetOp2();
+                                            }
+                                            assert(regOptionalSrc->IsRegOptionalUse());
+                                            assert(!regOptionalSrc->IsMultiRegCall());
+                                            if (!regOptionalSrc->isUsedFromSpillTemp())
+                                            {
+                                                regOptionalSrc->gtFlags |= GTF_NOREG_AT_USE;
+                                                regOptionalSrc->gtFlags |= GTF_SPILL;
+                                                treeNode->SetRegNum(REG_NA);
+                                            }
+                                        }
                                     }
                                 }
                             }
                         }
-                    }
-
-                    // We should never have to "spill after" a temp use, since
-                    // they're single use
-                    else
-                    {
-                        unreached();
                     }
                 }
             }
@@ -9653,10 +9675,6 @@ void LinearScan::lsraDispNode(GenTree* tree, LsraTupleDumpMode mode, bool hasDes
     }
     if (hasDest)
     {
-        if (mode == LinearScan::LSRA_DUMP_POST && tree->gtFlags & GTF_SPILLED)
-        {
-            assert(tree->gtHasReg());
-        }
         lsraGetOperandString(tree, mode, operandString, operandStringLength);
         printf("%-15s =", operandString);
     }

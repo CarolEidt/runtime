@@ -1068,9 +1068,14 @@ public:
     inline void ClearUnusedValue();
     inline bool IsUnusedValue() const;
     // RegOptional indicates that codegen can still generate code even if it isn't allocated a register.
-    inline bool IsRegOptional() const;
-    inline void SetRegOptional();
+    inline void ClearRegOptionalUse();
+    inline bool IsRegOptionalUse() const;
+    inline void SetRegOptionalUse();
+    inline void ClearRegOptionalDef();
+    inline bool IsRegOptionalDef() const;
+    inline void SetRegOptionalDef();
     inline void ClearRegOptional();
+    inline bool IsRegOptional() const;
 #ifdef DEBUG
     void dumpLIRFlags();
 #endif
@@ -2002,7 +2007,8 @@ public:
     {
         assert(IsValue());
         gtFlags &= ~GTF_CONTAINED;
-        ClearRegOptional();
+        ClearRegOptionalUse();
+        ClearRegOptionalDef();
     }
 
     bool CanCSE() const

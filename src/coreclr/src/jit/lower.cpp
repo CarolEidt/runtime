@@ -348,7 +348,7 @@ GenTree* Lowering::LowerNode(GenTree* node)
 #endif // !TARGET_ARMARCH
 
         case GT_KEEPALIVE:
-            node->gtGetOp1()->SetRegOptional();
+            node->gtGetOp1()->SetRegOptionalUse();
             break;
 
         default:
@@ -6448,7 +6448,7 @@ void Lowering::ContainCheckBitCast(GenTree* node)
         }
         else
         {
-            op1->SetRegOptional();
+            op1->SetRegOptionalUse();
         }
     }
     else if (op1->IsLocal())

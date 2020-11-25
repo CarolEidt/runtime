@@ -820,6 +820,36 @@ TempDsc* CodeGenInterface::getSpillTempDsc(GenTree* tree)
     return temp;
 }
 
+//----------------------------------------------------------------------
+// reassignSpillTempDsc: reassign the TempDsc corresponding to a spilled tree to a new tree.
+//
+// Arguments:
+//   oldTree  -  original spilled GenTree node
+//   newTree  -  new GenTree node to assign the spill temp to
+//
+// Return Value:
+//   TempDsc corresponding to tree
+TempDsc*  CodeGenInterface::reassignSpillTempDsc(GenTree* oldTree, GenTree* newTree)
+{
+	// oldTree must be in spilled state.
+	assert((oldTree->gtFlags & GTF_SPILLED) != 0);
+
+	// Get oldTree's SpillDsc.
+	RegSet::SpillDsc* prevDsc;
+	RegSet::SpillDsc* spillDsc = regSet.rsGetSpillInfo(oldTree, oldTree->GetRegNum(), &prevDsc);
+	assert(spillDsc != nullptr);
+	spillDsc->spillTree = newTree;
+
+	// TODO: Handle the case where the originally assigned registers differ.
+	// For now, we simply assign oldTree's regNum to newTree, since we don't yet support the
+	// scenario of reloading to a register when we've defined the node into a spill temp.
+	assert(newTree->GetRegNum() == REG_NA);
+	assert(newTree->isUsedFromSpillTemp());
+	newTree->SetRegNum(oldTree->GetRegNum());
+	TempDsc* temp = spillDsc->spillTemp;
+	return temp;
+}
+
 #ifdef TARGET_XARCH
 
 #ifdef TARGET_AMD64

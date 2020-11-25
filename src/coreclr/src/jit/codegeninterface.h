@@ -317,8 +317,9 @@ public:
     void spillReg(var_types type, TempDsc* tmp, regNumber reg);
     void reloadReg(var_types type, TempDsc* tmp, regNumber reg);
 
-    // The following method is used by xarch emitter for handling contained tree temps.
-    TempDsc* getSpillTempDsc(GenTree* tree);
+    // The following methods are used by xarch emitter for handling contained tree temps.
+	TempDsc* getSpillTempDsc(GenTree* tree);
+	TempDsc* reassignSpillTempDsc(GenTree* oldTree, GenTree* newTree);
 
 public:
     emitter* GetEmitter() const

@@ -38,8 +38,13 @@ public:
                                 // at all points during compilation: it is currently
                                 // only computed during target-dependent lowering.
 
-            RegOptional = 0x04, // Set on a node if it produces a value, but does not
-                                // require a register (i.e. it can be used from memory).
+            RegOptionalUse = 0x4, // Set on a node if its consumer can use a stack value
+                                  // (spill temp or lclVar) directly from memory.
+
+            RegOptionalDef = 0x8, // Set on a node if it can write directly to a stack
+                                  // location (spill temp or lclVar).
+                                  // One or more of its operands must be marked RegOptionalUse,
+                                  // or be a contained (non-register-candidate) lclVar.
         };
     };
 
@@ -327,19 +332,44 @@ inline bool GenTree::IsUnusedValue() const
     return (gtLIRFlags & LIR::Flags::UnusedValue) != 0;
 }
 
-inline void GenTree::SetRegOptional()
+inline void GenTree::SetRegOptionalUse()
 {
-    gtLIRFlags |= LIR::Flags::RegOptional;
+    gtLIRFlags |= LIR::Flags::RegOptionalUse;
+}
+
+inline void GenTree::ClearRegOptionalUse()
+{
+    gtLIRFlags &= ~LIR::Flags::RegOptionalUse;
+}
+
+inline bool GenTree::IsRegOptionalUse() const
+{
+    return (gtLIRFlags & LIR::Flags::RegOptionalUse) != 0;
+}
+
+inline void GenTree::SetRegOptionalDef()
+{
+    gtLIRFlags |= LIR::Flags::RegOptionalDef;
+}
+
+inline void GenTree::ClearRegOptionalDef()
+{
+    gtLIRFlags &= ~LIR::Flags::RegOptionalDef;
+}
+
+inline bool GenTree::IsRegOptionalDef() const
+{
+    return (gtLIRFlags & LIR::Flags::RegOptionalDef) != 0;
 }
 
 inline void GenTree::ClearRegOptional()
 {
-    gtLIRFlags &= ~LIR::Flags::RegOptional;
+    gtLIRFlags &= ~(LIR::Flags::RegOptionalDef | LIR::Flags::RegOptionalUse);
 }
 
 inline bool GenTree::IsRegOptional() const
 {
-    return (gtLIRFlags & LIR::Flags::RegOptional) != 0;
+    return (gtLIRFlags & LIR::Flags::RegOptionalDef | LIR::Flags::RegOptionalUse) != 0;
 }
 
 #endif // _LIR_H_

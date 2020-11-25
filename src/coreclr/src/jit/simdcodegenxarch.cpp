@@ -581,7 +581,7 @@ void CodeGen::genSIMDIntrinsicInit(GenTreeSIMD* simdNode)
             ins = getOpForSIMDIntrinsic(SIMDIntrinsicInit, baseType);
             if (op1->IsCnsFltOrDbl())
             {
-                GetEmitter()->emitInsBinary(ins, emitTypeSize(targetType), simdNode, op1);
+                GetEmitter()->emitInsBinaryRMW(ins, emitTypeSize(targetType), simdNode, simdNode, op1);
             }
             else if (op1->OperIsLocalAddr())
             {

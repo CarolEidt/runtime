@@ -1547,7 +1547,7 @@ void CodeGen::genConsumeRegs(GenTree* tree)
             LclVarDsc* varDsc = compiler->lvaTable + varNum;
 
             noway_assert(varDsc->GetRegNum() == REG_STK);
-            noway_assert(tree->IsRegOptional() || !varDsc->lvLRACandidate);
+            noway_assert(tree->IsRegOptionalUse() || !varDsc->lvLRACandidate);
 
             // Update the life of the lcl var.
             genUpdateLife(tree);
@@ -2212,6 +2212,10 @@ void CodeGen::genProduceReg(GenTree* tree)
                 gcInfo.gcMarkRegPtrVal(tree->GetRegNum(), tree->TypeGet());
             }
         }
+    }
+    else if (tree->IsRegOptionalDef())
+    {
+        tree->gtFlags |= GTF_SPILLED;
     }
 }
 

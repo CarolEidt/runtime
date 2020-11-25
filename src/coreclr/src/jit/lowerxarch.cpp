@@ -423,7 +423,7 @@ void Lowering::LowerPutArgStk(GenTreePutArgStk* putArgStk)
                     LclVarDsc* varDsc = &(comp->lvaTable[fieldNode->AsLclVarCommon()->GetLclNum()]);
                     if (!varDsc->lvDoNotEnregister)
                     {
-                        fieldNode->SetRegOptional();
+                        fieldNode->SetRegOptionalUse();
                     }
                     else
                     {
@@ -441,7 +441,7 @@ void Lowering::LowerPutArgStk(GenTreePutArgStk* putArgStk)
                     // than spilling, but this situation is not all that common, as most cases of promoted
                     // structs do not have a large number of fields, and of those most are lclVars or
                     // copy-propagated constants.
-                    fieldNode->SetRegOptional();
+                    fieldNode->SetRegOptionalUse();
                 }
             }
 
@@ -3624,7 +3624,7 @@ GenTree* Lowering::PreferredRegOptionalOperand(GenTree* tree)
 
     GenTree* op1 = tree->gtGetOp1();
     GenTree* op2 = tree->gtGetOp2();
-    assert(!op1->IsRegOptional() && !op2->IsRegOptional());
+    assert(!op1->IsRegOptionalUse() && !op2->IsRegOptionalUse());
 
     // We default to op1, as op2 is likely to have the shorter lifetime.
     GenTree* preferredOp = op1;
@@ -4077,7 +4077,7 @@ void Lowering::ContainCheckDivOrMod(GenTreeOp* node)
     {
         // If there are no containable operands, we can make an operand reg optional.
         // Div instruction allows only divisor to be a memory op.
-        divisor->SetRegOptional();
+        divisor->SetRegOptionalUse();
     }
 }
 
@@ -4207,7 +4207,7 @@ void Lowering::ContainCheckCast(GenTreeCast* node)
             {
                 // Mark castOp as reg optional to indicate codegen
                 // can still generate code if it is on stack.
-                castOp->SetRegOptional();
+                castOp->SetRegOptionalUse();
             }
         }
     }
@@ -4280,7 +4280,7 @@ void Lowering::ContainCheckCompare(GenTreeOp* cmp)
             // IsSafeToContainMem is expensive so we call it at most once for otherOp.
             // If we already called IsSafeToContainMem, it must have returned false;
             // otherwise, otherOp would be contained.
-            otherOp->SetRegOptional();
+            otherOp->SetRegOptionalUse();
         }
 
         return;
@@ -4301,7 +4301,7 @@ void Lowering::ContainCheckCompare(GenTreeOp* cmp)
             }
             else
             {
-                op1->SetRegOptional();
+                op1->SetRegOptionalUse();
             }
         }
     }
@@ -4337,17 +4337,7 @@ void Lowering::ContainCheckCompare(GenTreeOp* cmp)
             // One of op1 or op2 could be marked as reg optional
             // to indicate that codegen can still generate code
             // if one of them is on stack.
-            GenTree* regOptionalCandidate = op1->IsCnsIntOrI() ? op2 : PreferredRegOptionalOperand(cmp);
-
-            // IsSafeToContainMem is expensive so we call it at most once for each operand
-            // in this method. If we already called IsSafeToContainMem, it must have returned false;
-            // otherwise, the corresponding operand (op1 or op2) would be contained.
-            bool setRegOptional = (regOptionalCandidate == op1) ? isSafeToContainOp1 && IsSafeToContainMem(cmp, op1)
-                                                                : isSafeToContainOp2 && IsSafeToContainMem(cmp, op2);
-            if (setRegOptional)
-            {
-                regOptionalCandidate->SetRegOptional();
-            }
+            PreferredRegOptionalOperand(cmp)->SetRegOptionalUse();
         }
     }
 }
@@ -4409,7 +4399,7 @@ bool Lowering::LowerRMWMemOp(GenTreeIndir* storeInd)
 
     // We have already done containment analysis on the indirSrc op.
     // If any of its operands are marked regOptional, reset that now.
-    indirSrc->AsOp()->gtOp1->ClearRegOptional();
+    indirSrc->AsOp()->gtOp1->ClearRegOptionalUse();
     if (GenTree::OperIsBinary(oper))
     {
         // On Xarch RMW operations require the source to be an immediate or in a register.
@@ -4419,7 +4409,7 @@ bool Lowering::LowerRMWMemOp(GenTreeIndir* storeInd)
         {
             indirOpSource->ClearContained();
         }
-        indirSrc->AsOp()->gtOp2->ClearRegOptional();
+        indirSrc->AsOp()->gtOp2->ClearRegOptionalUse();
         JITDUMP("Lower succesfully detected an assignment of the form: *addrMode BinOp= source\n");
     }
     else
@@ -4603,7 +4593,7 @@ void Lowering::ContainCheckBoundsChk(GenTreeBoundsChk* node)
         else
         {
             // We can mark 'other' as reg optional, since it is not contained.
-            other->SetRegOptional();
+            other->SetRegOptionalUse();
         }
     }
 }
@@ -4632,7 +4622,7 @@ void Lowering::ContainCheckIntrinsic(GenTreeOp* node)
         {
             // Mark the operand as reg optional since codegen can still
             // generate code if op1 is on stack.
-            op1->SetRegOptional();
+            op1->SetRegOptionalUse();
         }
     }
 }
@@ -5286,7 +5276,7 @@ void Lowering::ContainCheckHWIntrinsic(GenTreeHWIntrinsic* node)
                 }
                 else if (supportsRegOptional)
                 {
-                    op1->SetRegOptional();
+                    op1->SetRegOptionalUse();
                 }
                 break;
             }
@@ -5353,7 +5343,7 @@ void Lowering::ContainCheckHWIntrinsic(GenTreeHWIntrinsic* node)
                     }
                     else if (supportsRegOptional)
                     {
-                        op2->SetRegOptional();
+                        op2->SetRegOptionalUse();
 
                         // TODO-XArch-CQ: For commutative nodes, either operand can be reg-optional.
                         //                https://github.com/dotnet/runtime/issues/6358
@@ -5397,7 +5387,7 @@ void Lowering::ContainCheckHWIntrinsic(GenTreeHWIntrinsic* node)
                                 }
                                 else if (supportsRegOptional)
                                 {
-                                    op2->SetRegOptional();
+                                    op2->SetRegOptionalUse();
                                 }
                             }
                             break;
@@ -5419,7 +5409,7 @@ void Lowering::ContainCheckHWIntrinsic(GenTreeHWIntrinsic* node)
                             }
                             else if (supportsRegOptional)
                             {
-                                op1->SetRegOptional();
+                                op1->SetRegOptionalUse();
                             }
                             break;
                         }
@@ -5437,7 +5427,7 @@ void Lowering::ContainCheckHWIntrinsic(GenTreeHWIntrinsic* node)
                                 }
                                 else if (supportsRegOptional)
                                 {
-                                    op1->SetRegOptional();
+                                    op1->SetRegOptionalUse();
                                 }
                             }
                             else if (IsContainableHWIntrinsicOp(node, op2, &supportsRegOptional))
@@ -5446,7 +5436,7 @@ void Lowering::ContainCheckHWIntrinsic(GenTreeHWIntrinsic* node)
                             }
                             else if (supportsRegOptional)
                             {
-                                op2->SetRegOptional();
+                                op2->SetRegOptionalUse();
                             }
                             break;
                         }
@@ -5459,7 +5449,7 @@ void Lowering::ContainCheckHWIntrinsic(GenTreeHWIntrinsic* node)
                             }
                             else if (supportsRegOptional)
                             {
-                                op1->SetRegOptional();
+                                op1->SetRegOptionalUse();
                             }
                             break;
                         }
@@ -5566,7 +5556,7 @@ void Lowering::ContainCheckHWIntrinsic(GenTreeHWIntrinsic* node)
                             //                https://github.com/dotnet/runtime/issues/6358
 
                             // 213 form: op1 = (op2 * op1) + op3
-                            op3->SetRegOptional();
+                            op3->SetRegOptionalUse();
                         }
                     }
                     else
@@ -5585,7 +5575,7 @@ void Lowering::ContainCheckHWIntrinsic(GenTreeHWIntrinsic* node)
                                 }
                                 else if (supportsRegOptional)
                                 {
-                                    op2->SetRegOptional();
+                                    op2->SetRegOptionalUse();
                                 }
                                 break;
                             }
@@ -5607,7 +5597,7 @@ void Lowering::ContainCheckHWIntrinsic(GenTreeHWIntrinsic* node)
                                 }
                                 else if (supportsRegOptional)
                                 {
-                                    op2->SetRegOptional();
+                                    op2->SetRegOptionalUse();
                                 }
                                 break;
                             }
@@ -5657,7 +5647,7 @@ void Lowering::ContainCheckHWIntrinsic(GenTreeHWIntrinsic* node)
                             }
                             else if (supportsRegOptional)
                             {
-                                op2->SetRegOptional();
+                                op2->SetRegOptionalUse();
                             }
                             break;
                         }

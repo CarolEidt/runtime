@@ -266,18 +266,14 @@ private:
             isSafeToMarkOp1 && tree->OperIsCommutative() && (operatorSize == genTypeSize(op1->TypeGet()));
         const bool op2Legal = isSafeToMarkOp2 && (operatorSize == genTypeSize(op2->TypeGet()));
 
-        GenTree* regOptionalOperand = nullptr;
-        if (op1Legal)
+        GenTree* regOptionalNode = op1Legal ? (op2Legal ? PreferredRegOptionalOperand(tree) : op1) : (op2Legal ? op2 : nullptr);
+        if (regOptionalNode != nullptr)
         {
-            regOptionalOperand = op2Legal ? PreferredRegOptionalOperand(tree) : op1;
-        }
-        else if (op2Legal)
-        {
-            regOptionalOperand = op2;
-        }
-        if (regOptionalOperand != nullptr)
-        {
-            regOptionalOperand->SetRegOptional();
+            regOptionalNode->SetRegOptionalUse();
+            if (!regOptionalNode->OperIsLocal())
+            {
+                tree->SetRegOptionalDef();
+            }
         }
     }
 #endif // defined(TARGET_XARCH)

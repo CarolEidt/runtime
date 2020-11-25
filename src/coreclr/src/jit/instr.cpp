@@ -987,7 +987,7 @@ void CodeGen::inst_RV_TT_IV(instruction ins, emitAttr attr, regNumber reg1, GenT
 
         if (rmOp->isUsedFromSpillTemp())
         {
-            assert(rmOp->IsRegOptional());
+            assert(rmOp->IsRegOptionalUse());
 
             tmpDsc = getSpillTempDsc(rmOp);
             varNum = tmpDsc->tdTempNum();
@@ -1060,7 +1060,7 @@ void CodeGen::inst_RV_TT_IV(instruction ins, emitAttr attr, regNumber reg1, GenT
 
                 case GT_LCL_VAR:
                 {
-                    assert(rmOp->IsRegOptional() ||
+                    assert(rmOp->IsRegOptionalUse() ||
                            !compiler->lvaGetDesc(rmOp->AsLclVar()->GetLclNum())->lvIsRegCandidate());
                     varNum = rmOp->AsLclVar()->GetLclNum();
                     offset = 0;
@@ -1116,7 +1116,7 @@ void CodeGen::inst_RV_RV_TT(
 
         if (op2->isUsedFromSpillTemp())
         {
-            assert(op2->IsRegOptional());
+            assert(op2->IsRegOptionalUse());
 
             tmpDsc = getSpillTempDsc(op2);
             varNum = tmpDsc->tdTempNum();
@@ -1191,7 +1191,7 @@ void CodeGen::inst_RV_RV_TT(
 
                 case GT_LCL_VAR:
                 {
-                    assert(op2->IsRegOptional() ||
+                    assert(op2->IsRegOptionalUse() ||
                            !compiler->lvaGetDesc(op2->AsLclVar()->GetLclNum())->lvIsRegCandidate());
                     varNum = op2->AsLclVar()->GetLclNum();
                     offset = 0;

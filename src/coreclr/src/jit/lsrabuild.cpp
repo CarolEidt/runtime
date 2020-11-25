@@ -652,7 +652,7 @@ RefPosition* LinearScan::newUseRefPosition(Interval* theInterval,
     GenTree* treeNode = isCandidateLocalRef(theTreeNode) ? theTreeNode : nullptr;
 
     RefPosition* pos = newRefPosition(theInterval, currentLoc, RefTypeUse, treeNode, mask, multiRegIdx);
-    if (theTreeNode->IsRegOptional())
+    if (theTreeNode->IsRegOptionalUse())
     {
         pos->setRegOptional(true);
     }
@@ -1301,7 +1301,7 @@ bool LinearScan::checkContainedOrCandidateLclVar(GenTreeLclVar* lclNode)
         isCandidate = isCandidateMultiRegLclVar(lclNode);
         if (isCandidate)
         {
-            assert(!lclNode->IsRegOptional());
+            assert(!lclNode->IsRegOptionalUse());
         }
         else
         {

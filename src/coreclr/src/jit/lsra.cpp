@@ -2408,6 +2408,33 @@ BasicBlock* LinearScan::findPredBlockForLiveIn(BasicBlock* block,
             assert(predBlock != nullptr);
             JITDUMP("\n\nNo allocated predecessor; ");
         }
+        else
+        {
+            // If predBlock ends in a backedge, use the predecessor of the loop head, if all the live-in
+            // of this block are in the live-out of that block, to reduce the need for resolution moves.
+            if (predBlock->bbJumpKind == BBJ_COND)
+            {
+                BasicBlock* otherSucc = (predBlock->bbNext == block) ? predBlock->bbJumpDest : predBlock->bbNext;
+                if (isBlockVisited(otherSucc) && (otherSucc->bbWeight >= predBlock->bbWeight))
+                {
+                    unsigned loopPredBlockBBNum = blockInfo[otherSucc->bbNum].predBBNum;
+                    if ((otherSucc->bbFlags & BBF_LOOP_HEAD) != 0)
+                    {
+                        for (flowList* pred = otherSucc->bbPreds; pred != nullptr; pred = pred->flNext)
+                        {
+                            BasicBlock* candidatePredBlock = pred->flBlock;
+                            if ((candidatePredBlock->bbNum == loopPredBlockBBNum) &&
+                                VarSetOps::IsEmpty(compiler, VarSetOps::Diff(compiler, block->bbLiveIn,
+                                                                             candidatePredBlock->bbLiveOut)))
+                            {
+                                predBlock = candidatePredBlock;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
     return predBlock;
 }
@@ -5372,7 +5399,8 @@ void LinearScan::allocateRegisters()
     }
 #endif // DEBUG
 
-    BasicBlock* currentBlock = nullptr;
+    BasicBlock* currentBlock        = nullptr;
+    BasicBlock* backEdgeTargetBlock = nullptr;
 
     LsraLocation prevLocation    = MinLocation;
     regMaskTP    regsToFree      = RBM_NONE;
@@ -5505,6 +5533,7 @@ void LinearScan::allocateRegisters()
                 currentBlock = moveToNextBlock();
                 INDEBUG(dumpLsraAllocationEvent(LSRA_EVENT_START_BB, nullptr, REG_NA, currentBlock));
             }
+            backEdgeTargetBlock = nullptr;
         }
 
         if (refType == RefTypeBB)
@@ -5557,22 +5586,59 @@ void LinearScan::allocateRegisters()
             continue;
         }
 
-        // If this is an exposed use, do nothing - this is merely a placeholder to attempt to
-        // ensure that a register is allocated for the full lifetime.  The resolution logic
-        // will take care of moving to the appropriate register if needed.
-
-        if (refType == RefTypeExpUse)
-        {
-            INDEBUG(dumpLsraAllocationEvent(LSRA_EVENT_EXP_USE));
-            continue;
-        }
-
         regNumber assignedRegister = REG_NA;
 
         assert(currentRefPosition->isIntervalRef());
         currentInterval = currentRefPosition->getInterval();
         assert(currentInterval != nullptr);
         assignedRegister = currentInterval->physReg;
+
+        // If this is an exposed use, check for the case where the target of the backedge has the
+        // variable on the stack. For this case, we can spill the most recent RefPosition and make
+        // it less likely we'll have to split the backedge.  Otherwise, if it's in a different
+        // register we can't easily do the move here; the resolution logic will take care of moving
+        // it to the appropriate register as needed.
+
+        if (refType == RefTypeExpUse)
+        {
+            if (assignedRegister != REG_NA)
+            {
+                if (backEdgeTargetBlock == nullptr)
+                {
+                    for (BasicBlock* succBlock : currentBlock->GetAllSuccs(compiler))
+                    {
+                        if (((succBlock->bbFlags & BBF_LOOP_HEAD) != 0) &&
+                            ((succBlock == currentBlock) ||
+                             (isBlockVisited(succBlock) && (succBlock->bbWeight > currentBlock->bbWeight))))
+                        {
+                            backEdgeTargetBlock = succBlock;
+                        }
+                    }
+                }
+                if ((backEdgeTargetBlock != nullptr) && (VarSetOps::IsMember(compiler, backEdgeTargetBlock->bbLiveIn,
+                                                                             currentInterval->getVarIndex(compiler))))
+                {
+                    // If the backedge target is the first BB, and this is a parameter, use its allocated location.
+                    // Otherwise, we'll use its location from the InVarToRegMap of the backedge target.
+                    if ((backEdgeTargetBlock == compiler->fgFirstBB) &&
+                        (currentInterval->firstRefPosition->refType == RefTypeParamDef))
+                    {
+                        assignedRegister = currentInterval->firstRefPosition->assignedReg();
+                    }
+                    else
+                    {
+                        VarToRegMap backEdgeTargetVarToRegMap = getInVarToRegMap(backEdgeTargetBlock->bbNum);
+                        assignedRegister = getVarReg(backEdgeTargetVarToRegMap, currentInterval->getVarIndex(compiler));
+                    }
+                    if (assignedRegister == REG_STK)
+                    {
+                        spillInterval(currentInterval, previousRefPosition DEBUGARG(currentRefPosition));
+                    }
+                }
+            }
+            INDEBUG(dumpLsraAllocationEvent(LSRA_EVENT_EXP_USE, currentInterval, assignedRegister, currentBlock));
+            continue;
+        }
 
         // Identify the special cases where we decide up-front not to allocate
         bool allocate = true;

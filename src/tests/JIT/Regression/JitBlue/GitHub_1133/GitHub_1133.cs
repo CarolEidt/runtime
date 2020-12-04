@@ -9,14 +9,12 @@ class GitHub_1133
     static Guid s_dt;
 
     [MethodImpl(MethodImplOptions.NoInlining)]
-    private static Guid TestValueTypesInInlinedMethods()
+    private static void TestValueTypesInInlinedMethods()
     {
         var dt = new Guid();
 
         // This method, once inlined, should directly copy the newly created 'Guid' to s_dt.
         Method1(dt);
-
-        return dt;
     }
 
     private static void Method1(Guid dt)
@@ -39,11 +37,7 @@ class GitHub_1133
         int result = 100;
         try
         {
-            Guid g = TestValueTypesInInlinedMethods();
-            if (g != s_dt)
-            {
-                result = -1;
-            }
+            TestValueTypesInInlinedMethods();
         }
         catch (Exception)
         {

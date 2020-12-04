@@ -518,8 +518,7 @@ bool LinearScan::conflictingFixedRegReference(regNumber regNum, RefPosition* ref
 
     // Otherwise, check for conflicts.
     // There is a conflict if:
-    // 1. There is a recent RefPosition on this RegRecord that is at this location,
-    //    except in the case where it is a special "putarg" that is associated with this interval, OR
+    // 1. There is a recent RefPosition on this RegRecord that is at this location OR
     // 2. There is an upcoming RefPosition at this location, or at the next location
     //    if refPosition is a delayed use (i.e. must be kept live through the next/def location).
 
@@ -2759,46 +2758,49 @@ bool LinearScan::isMatchingConstant(RegRecord* physRegRecord, RefPosition* refPo
     GenTree* otherTreeNode = physRegRecord->assignedInterval->firstRefPosition->treeNode;
     noway_assert(otherTreeNode != nullptr);
 
-    if (refPosition->treeNode->OperGet() == otherTreeNode->OperGet())
+    if (refPosition->treeNode->OperGet() != otherTreeNode->OperGet())
     {
-        switch (otherTreeNode->OperGet())
+        return false;
+    }
+
+    switch (otherTreeNode->OperGet())
+    {
+        case GT_CNS_INT:
         {
-            case GT_CNS_INT:
+            ssize_t v1 = refPosition->treeNode->AsIntCon()->IconValue();
+            ssize_t v2 = otherTreeNode->AsIntCon()->IconValue();
+            if ((v1 == v2) && (varTypeGCtype(refPosition->treeNode) == varTypeGCtype(otherTreeNode) || v1 == 0))
             {
-                ssize_t v1 = refPosition->treeNode->AsIntCon()->IconValue();
-                ssize_t v2 = otherTreeNode->AsIntCon()->IconValue();
-                if ((v1 == v2) && (varTypeGCtype(refPosition->treeNode) == varTypeGCtype(otherTreeNode) || v1 == 0))
-                {
 #ifdef TARGET_64BIT
-                    // If the constant is negative, only reuse registers of the same type.
-                    // This is because, on a 64-bit system, we do not sign-extend immediates in registers to
-                    // 64-bits unless they are actually longs, as this requires a longer instruction.
-                    // This doesn't apply to a 32-bit system, on which long values occupy multiple registers.
-                    // (We could sign-extend, but we would have to always sign-extend, because if we reuse more
-                    // than once, we won't have access to the instruction that originally defines the constant).
-                    if ((refPosition->treeNode->TypeGet() == otherTreeNode->TypeGet()) || (v1 >= 0))
+                // If the constant is negative, only reuse registers of the same type.
+                // This is because, on a 64-bit system, we do not sign-extend immediates in registers to
+                // 64-bits unless they are actually longs, as this requires a longer instruction.
+                // This doesn't apply to a 32-bit system, on which long values occupy multiple registers.
+                // (We could sign-extend, but we would have to always sign-extend, because if we reuse more
+                // than once, we won't have access to the instruction that originally defines the constant).
+                if ((refPosition->treeNode->TypeGet() == otherTreeNode->TypeGet()) || (v1 >= 0))
 #endif // TARGET_64BIT
-                    {
-                        return true;
-                    }
-                }
-                break;
-            }
-            case GT_CNS_DBL:
-            {
-                // For floating point constants, the values must be identical, not simply compare
-                // equal.  So we compare the bits.
-                if (refPosition->treeNode->AsDblCon()->isBitwiseEqual(otherTreeNode->AsDblCon()) &&
-                    (refPosition->treeNode->TypeGet() == otherTreeNode->TypeGet()))
                 {
                     return true;
                 }
-                break;
             }
-            default:
-                break;
+            break;
         }
+        case GT_CNS_DBL:
+        {
+            // For floating point constants, the values must be identical, not simply compare
+            // equal.  So we compare the bits.
+            if (refPosition->treeNode->AsDblCon()->isBitwiseEqual(otherTreeNode->AsDblCon()) &&
+                (refPosition->treeNode->TypeGet() == otherTreeNode->TypeGet()))
+            {
+                return true;
+            }
+            break;
+        }
+        default:
+            break;
     }
+
     return false;
 }
 
@@ -2816,8 +2818,7 @@ bool LinearScan::isMatchingConstant(RegRecord* physRegRecord, RefPosition* refPo
 //    no free register or registers with lower-weight Intervals that can be spilled.
 //
 // Notes:
-//    This method will prefer to allocate a free register, but if none are available, or if
-//    this is not a last use and all availalbe registers will be killed prior to the next use,
+//    This method will prefer to allocate a free register, but if none are available,
 //    it will look for a lower-weight Interval to spill.
 //    Weight and farthest distance of next reference are used to determine whether an Interval
 //    currently occupying a register should be spilled. It will be spilled either:
@@ -3052,7 +3053,7 @@ regNumber LinearScan::allocateReg(Interval* currentInterval, RefPosition* refPos
         FREE              = 0x10000, // It is not currently assigned to an *active* interval
 
         // These are the original criteria for comparing registers that are free.
-        VALUE_AVAILABLE    = 0x8000, // It is a constant value that is already in an acceptable register.
+        CONST_AVAILABLE    = 0x8000, // It is a constant value that is already in an acceptable register.
         THIS_ASSIGNED      = 0x4000, // It is in the interval's preference set and it is already assigned to this interval.
         COVERS             = 0x2000, // It is in the interval's preference set and it covers the current range.
         OWN_PREFERENCE     = 0x1000, // It is in the preference set of this interval.
@@ -3060,15 +3061,17 @@ regNumber LinearScan::allocateReg(Interval* currentInterval, RefPosition* refPos
         RELATED_PREFERENCE = 0x0400, // It is in the preference set of the related interval.
         CALLER_CALLEE      = 0x0200, // It is in the right "set" for the interval (caller or callee-save).
         UNASSIGNED         = 0x0100, // It is not currently assigned to any (active or inactive) interval
-        COVERS_FULL        = 0x0080,
-        BEST_FIT           = 0x0040,
-        IS_PREV_REG        = 0x0020,
-        REG_ORDER          = 0x0010,
+        COVERS_FULL        = 0x0080, // It covers the full range of the interval from current position to the end.
+        BEST_FIT           = 0x0040, // The available range is the closest match to the full range of the interval.
+        IS_PREV_REG        = 0x0020, // This register was previously assigned to the interval.
+        REG_ORDER          = 0x0010, // Tie-breaker
 
         // These are the original criteria for comparing registers that are in use.
         SPILL_COST         = 0x0008, // It has the lowest cost of all the candidates.
         FAR_NEXT_REF       = 0x0004, // It has a farther next reference than the best candidate thus far.
         PREV_REG_OPT       = 0x0002, // The previous RefPosition of its current assigned interval is RegOptional.
+
+        // TODO-CQ: Consider using REG_ORDER as a tie-breaker even for busy registers.
         REG_NUM            = 0x0001, // It has a lower register number.
     };
 
@@ -3179,7 +3182,7 @@ regNumber LinearScan::allocateReg(Interval* currentInterval, RefPosition* refPos
         found = isSingleRegister(candidates);
     }
 
-    // Apply the VALUE_AVAILABLE (matching constant) heuristic. Only applies if we have freeCandidates.
+    // Apply the CONST_AVAILABLE (matching constant) heuristic. Only applies if we have freeCandidates.
     // Note that we always need to define the 'matchingConstants' set.
     if (freeCandidates != RBM_NONE)
     {
@@ -3188,7 +3191,7 @@ regNumber LinearScan::allocateReg(Interval* currentInterval, RefPosition* refPos
             matchingConstants = getMatchingConstants(candidates, currentInterval, refPosition);
             if (matchingConstants != RBM_NONE)
             {
-                bestScore |= VALUE_AVAILABLE;
+                bestScore |= CONST_AVAILABLE;
                 candidates = matchingConstants;
                 found = isSingleRegister(candidates);
             }
@@ -3654,7 +3657,7 @@ regNumber LinearScan::allocateReg(Interval* currentInterval, RefPosition* refPos
             }
             else
             {
-                assert((bestScore & VALUE_AVAILABLE) == 0);
+                assert((bestScore & CONST_AVAILABLE) == 0);
             }
         }
     }
